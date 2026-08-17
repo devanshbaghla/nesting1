@@ -102,6 +102,11 @@ async def create_job(
         raise HTTPException(422, str(exc)) from exc
 
     job.audit = stats
+    if stats.get("repaired"):
+        # the nested output is derived from the repaired solid, not the file
+        # that was uploaded — say so where the user is already looking
+        job.log.append(f"input mesh was not a closed solid; "
+                       f"{stats['repair']['summary']}")
     store.submit(job)
     return {"job_id": job.id, "status": job.status, "mesh": stats}
 

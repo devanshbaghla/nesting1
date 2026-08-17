@@ -71,10 +71,13 @@ from scipy.ndimage import distance_transform_edt
 from scipy.signal import fftconvolve
 from scipy.spatial import cKDTree
 
+from .mesh_repair import MeshRepair, MeshRepairError, RepairReport
+
 __all__ = [
     "MeshAudit", "ScanlineVoxelizer", "ClearanceGrid", "TranslationOracle",
     "OrientationSet", "SurfacePairDistance", "Refiner", "Geometry",
     "Validation", "Preview", "PairNester", "NestResult",
+    "MeshRepair", "MeshRepairError", "RepairReport",
 ]
 
 
@@ -134,12 +137,18 @@ class MeshAudit:
             out[name] = float(ConvexHull(pts).volume)   # 2D hull "volume" = area
         return out
 
-    def assert_usable(self):
+    def assert_usable(self, repair: bool = False):
+        """Gate the intake, optionally closing an open mesh first.
+
+        ``repair=True`` runs :meth:`MeshRepair.ensure_solid` and rebinds
+        ``self.mesh`` to the repaired copy, so the report describes what will
+        actually be nested rather than what arrived.
+        """
+        if repair:
+            self.mesh, _ = MeshRepair.ensure_solid(self.mesh)
         r = self.report()
-        if not r["watertight"]:
-            raise ValueError("mesh is not watertight; parity voxelisation is undefined")
-        if not r["winding_consistent"]:
-            raise ValueError("inconsistent winding; face normals must agree")
+        if not (r["watertight"] and r["winding_consistent"]):
+            raise MeshRepairError(MeshRepair.describe_defect(self.mesh))
         return r
 
 
@@ -157,6 +166,11 @@ class ScanlineVoxelizer:
     A voxel is occupied iff its centre lies inside the mesh. Accuracy on a
     real part: +0.18% volume error at 0.5 mm pitch, max 0.88% over 40 random
     orientations.
+
+    :meth:`rasterize` assumes a closed surface and does not check — on an open
+    mesh the parity fill runs past the boundary and returns a wrong solid with
+    no error. Use :meth:`solid` at any entry point where the mesh has not
+    already been through :class:`MeshRepair`.
     """
 
     #: irrational jitter (mm-scale) keeping sample rays off edges and vertices
@@ -244,6 +258,23 @@ class ScanlineVoxelizer:
         occ = np.cumsum(acc, axis=1)[:, :nz] > 0
         return occ.reshape(nx, ny, nz), i0
 
+    @classmethod
+    def solid(cls, mesh: trimesh.Trimesh, pitch: float, repair: bool = True,
+              log=None) -> tuple[np.ndarray, np.ndarray, trimesh.Trimesh]:
+        """Rasterise, closing the mesh first if it is open.
+
+        Returns ``(occ, i0, mesh)``. The third element is the mesh the grid was
+        actually built from — the repaired copy when a repair happened — and
+        callers **must** adopt it. Bounds shift when holes are filled, and a
+        grid built from one mesh with translations measured against another is
+        wrong in a way nothing downstream would notice.
+
+        :raises MeshRepairError: the mesh is open and cannot be closed safely.
+        """
+        mesh, _ = MeshRepair.ensure_solid(mesh, allow_repair=repair, log=log)
+        occ, i0 = cls.rasterize(mesh, pitch)
+        return occ, i0, mesh
+
     @staticmethod
     def volume_error(mesh: trimesh.Trimesh, pitch: float) -> float:
         """Relative volume error of the voxelisation — a cheap self-test."""
@@ -288,9 +319,13 @@ class ClearanceGrid:
     recover the slack afterwards with :class:`Refiner`.
     """
 
-    def __init__(self, mesh: trimesh.Trimesh, pitch: float, radius: float):
+    def __init__(self, mesh: trimesh.Trimesh, pitch: float, radius: float,
+                 repair: bool = True):
+        # `solid` may hand back a repaired copy; bind that one, because
+        # TranslationOracle measures translations against self.mesh.bounds and
+        # those must describe the geometry the grid was built from
+        occ, i0, mesh = ScanlineVoxelizer.solid(mesh, pitch, repair=repair)
         self.mesh, self.pitch, self.radius = mesh, pitch, radius
-        occ, i0 = ScanlineVoxelizer.rasterize(mesh, pitch)
         pad = int(np.ceil(radius / pitch)) + 2
         padded = np.zeros(np.array(occ.shape) + 2 * pad, bool)
         padded[pad:-pad, pad:-pad, pad:-pad] = occ
@@ -954,14 +989,16 @@ class PairNester:
 
     def __init__(self, mesh: trimesh.Trimesh, clearance: float = 5.0,
                  coarse_pitch: float = 1.0, fine_pitch: float = 0.5,
-                 n_samples: int = 220_000, verbose: bool = True):
-        if not mesh.is_watertight:
-            raise ValueError("mesh must be watertight for solid voxelisation")
-        self.mesh = mesh
+                 n_samples: int = 220_000, verbose: bool = True,
+                 repair: bool = True):
+        self.verbose = verbose
+        # an open mesh is closed here, once, so every stage below sees the same
+        # geometry; MeshRepairError carries wording fit to show a user
+        self.mesh, self.repair_report = MeshRepair.ensure_solid(
+            mesh, allow_repair=repair, log=self._log)
         self.clearance = clearance
         self.coarse_pitch, self.fine_pitch = coarse_pitch, fine_pitch
         self.n_samples = n_samples
-        self.verbose = verbose
         self.result: NestResult | None = None
 
     def _log(self, msg):

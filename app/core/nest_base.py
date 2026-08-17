@@ -42,6 +42,7 @@ from pathlib import Path
 import numpy as np
 import trimesh
 
+from .mesh_repair import MeshRepair, MeshRepairError, RepairReport
 from .nesting3d import (
     Geometry, MeshAudit, NestResult, PairNester, Preview, Refiner,
     SurfacePairDistance, Validation,
@@ -84,6 +85,7 @@ class NestingRecommender:
     def __init__(self, config: NestingConfig | None = None):
         self.cfg = config or NesterFactory.config("standard")
         self.log_lines: list[str] = []
+        self.repair_report: RepairReport | None = None
 
     def _log(self, msg=""):
         self.log_lines.append(str(msg))
@@ -92,17 +94,21 @@ class NestingRecommender:
 
     # -- 1. load ----------------------------------------------------------- #
     def load(self, path: Path) -> trimesh.Trimesh:
+        """Read the STL and hand back a mesh that is safe to voxelise.
+
+        A closed, consistently wound mesh is returned exactly as it was read.
+        An open one is repaired here and nowhere else, so every stage below —
+        audit, self-tests, both sweeps, refinement, export — sees one agreed
+        geometry. Set ``repair=False`` in the config to refuse open meshes
+        instead of fixing them.
+
+        :raises MeshRepairError: the mesh is open and cannot be closed safely.
+        """
         mesh = trimesh.load(path, force="mesh")
         if isinstance(mesh, trimesh.Scene):
             mesh = mesh.dump(concatenate=True)
-        if self.cfg.repair and not mesh.is_watertight:
-            for fn in (lambda m: m.merge_vertices(),
-                       lambda m: trimesh.repair.fill_holes(m),
-                       lambda m: trimesh.repair.fix_normals(m)):
-                try:
-                    fn(mesh)
-                except Exception:
-                    pass
+        mesh, self.repair_report = MeshRepair.ensure_solid(
+            mesh, allow_repair=self.cfg.repair, log=self._log)
         return mesh
 
     # -- 2. audit + self-tests (gates) ------------------------------------- #
@@ -438,6 +444,7 @@ class NestingRecommender:
         payload = {
             "input": str(stl_path),
             "config": self.cfg.to_dict(),
+            "repair": self.repair_report.to_dict() if self.repair_report else None,
             "audit": audit,
             "self_tests": tests,
             "baselines": baselines,
@@ -487,7 +494,10 @@ def main(argv=None):
     p.add_argument("--coarse-pitch", type=float)
     p.add_argument("--fine-pitch", type=float)
     p.add_argument("--samples", type=int, dest="n_samples")
-    p.add_argument("--repair", action="store_true")
+    p.add_argument("--repair", dest="repair", action="store_true", default=None,
+                   help="repair an open mesh before nesting (the default)")
+    p.add_argument("--no-repair", dest="repair", action="store_false",
+                   help="refuse an open mesh instead of repairing it")
     p.add_argument("-q", "--quiet", action="store_true")
     p.add_argument("--describe", action="store_true",
                    help="print the algorithm registry and exit")
@@ -505,6 +515,10 @@ def main(argv=None):
         verbose=not a.quiet)
     try:
         NestingRecommender(cfg).recommend(a.stl, a.out_dir, a.top)
+    except MeshRepairError as exc:
+        # a bad input file, not a bug: say what is wrong and stop, no traceback
+        print(f"\n{exc}", file=sys.stderr)
+        return 2
     except Exception as exc:
         print(f"\nFAILED: {exc}", file=sys.stderr)
         traceback.print_exc()

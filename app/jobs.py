@@ -24,6 +24,7 @@ import numpy as np
 import trimesh
 
 from . import config
+from .core.mesh_repair import MeshRepair, MeshRepairError
 from .core.nest_base import NestingRecommender
 from .core.nesting_factory import NesterFactory
 from .renders import render
@@ -134,6 +135,13 @@ class JobStore:
             job.baselines = rec.baseline_data
             job.status, job.stage, job.progress = "done", "complete", 1.0
             job.log.append(f"finished in {time.time() - t0:.0f}s")
+        except MeshRepairError as exc:
+            # a bad input file, not a bug — the message is already written for
+            # the user, and a traceback in the job log would only obscure it
+            job.status = "failed"
+            job.stage = "failed"
+            job.error = str(exc)
+            job.log.append("ERROR " + str(exc))
         except Exception as exc:
             job.status = "failed"
             job.stage = "failed"
@@ -175,8 +183,18 @@ class _WebRecommender(NestingRecommender):
                                      tests, baselines)
 
 
-def validate_upload(path: Path) -> dict:
-    """Reject unusable uploads before a worker slot is spent on them."""
+def validate_upload(path: Path, repair: bool = True) -> dict:
+    """Reject unusable uploads before a worker slot is spent on them.
+
+    An open mesh is repaired here rather than at the start of the job, and the
+    repaired solid is written back over the uploaded copy. Two reasons: the
+    user learns about it in the upload response instead of minutes later in a
+    failed job, and the worker then loads a mesh that needs no repair — one
+    repair per upload, and the STL on disk matches the results derived from it.
+
+    :raises ValueError: unusable file. ``MeshRepairError`` is a ``ValueError``,
+        so an unrepairable mesh surfaces through the same 422 as the rest.
+    """
     size_mb = path.stat().st_size / 1e6
     if size_mb > config.MAX_UPLOAD_MB:
         raise ValueError(f"file is {size_mb:.1f} MB, limit is {config.MAX_UPLOAD_MB} MB")
@@ -191,14 +209,17 @@ def validate_upload(path: Path) -> dict:
     if len(mesh.faces) > config.MAX_FACES:
         raise ValueError(f"{len(mesh.faces):,} faces exceeds the "
                          f"{config.MAX_FACES:,} limit; decimate first")
-    if not mesh.is_watertight:
-        raise ValueError("mesh is not watertight — solid voxelisation is "
-                         "undefined for an open surface. Repair it in your CAD "
-                         "tool, or retry with the repair option enabled.")
+
+    mesh, report = MeshRepair.ensure_solid(mesh, allow_repair=repair)
+    if report.repaired:
+        mesh.export(str(path))
+
     return {"faces": int(len(mesh.faces)),
             "extents": [round(float(v), 2) for v in mesh.extents],
             "volume": round(float(mesh.volume), 1),
-            "fill_ratio": round(float(mesh.volume / np.prod(mesh.extents)), 4)}
+            "fill_ratio": round(float(mesh.volume / np.prod(mesh.extents)), 4),
+            "repaired": bool(report.repaired),
+            "repair": report.to_dict()}
 
 
 store = JobStore()

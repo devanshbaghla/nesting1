@@ -129,9 +129,22 @@ Pareto are not beaten on both volume *and* footprint simultaneously.
 
 ## Things worth knowing
 
-**Watertight meshes only.** Solid voxelisation by parity is undefined for an
-open surface, so non-watertight uploads are rejected at validation rather than
-silently producing a wrong answer. Repair in your CAD tool first.
+**Open meshes are repaired, then verified.** Solid voxelisation by parity is
+undefined for an open surface — on a column that sees a hole the fill runs past
+the boundary and returns a wrong solid with no error at all. So an upload that
+is not a closed solid goes through `app/core/mesh_repair.py` first: weld
+duplicate vertices, drop degenerate and duplicate faces, agree the winding,
+fill the remaining holes, fix inverted normals. If that produces a closed solid
+the job runs normally and the repaired STL replaces the uploaded copy, so the
+results match the geometry on disk; the repair is reported in the job log and
+in `recommendations.json`.
+
+Repairs are checked rather than trusted. `fill_holes` will cap a large opening
+with a flat lid, giving a watertight mesh that is not the part, so a repaired
+solid must have positive volume and fit inside its own convex hull. A mesh that
+cannot be closed safely — a surface patch, a zero-thickness shell — is refused
+with an explanation instead of being nested. Pass `--no-repair` to the CLI to
+refuse open meshes outright.
 
 **`refiner=none` leaves gaps loose.** It keeps the conservative lattice pose —
 still valid, just further apart than requested (6–12 mm where you asked for 5).

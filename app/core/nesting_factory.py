@@ -216,7 +216,9 @@ class NestingConfig:
 
     robustness_trials: int = 12
     cross_check: bool = True
-    repair: bool = False
+    #: attempt automatic repair when the input mesh is not a closed solid.
+    #: Watertight input never reaches the repair path, so this is inert for it.
+    repair: bool = True
     origin_corner: bool = True
     verbose: bool = True
 
