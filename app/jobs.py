@@ -103,6 +103,7 @@ class JobStore:
                 clearance=job.params["clearance"],
                 objective=job.params["objective"],
                 refiner=job.params.get("refiner"),
+                distance_backend=job.params.get("distance_backend"),
                 top_n=job.params["top_n"],
                 verbose=False,
             )

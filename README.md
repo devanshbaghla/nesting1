@@ -166,9 +166,39 @@ branch-and-bound over placement order.
 pinned at identity, so global rotations of the pair are not searched. The
 honest claim is "best found by a well-covered search."
 
-**Single worker by default.** The engine is CPU-bound on one core, so
-concurrent jobs make each slower without improving throughput. Jobs queue.
-Raise `NEST_JOB_WORKERS` only if you have cores to spare.
+**Single worker by default.** A job already spreads its own KD-tree queries
+across every core (`NEST_KD_WORKERS`, `-1` by default — worth ~3x on the whole
+run), so concurrent jobs mostly contend for the same cores. Jobs queue. If you
+raise `NEST_JOB_WORKERS`, cap `NEST_KD_WORKERS` to match or the jobs will
+oversubscribe each other.
+
+**Two distance backends.** The surface-to-surface distance is the whole cost of
+a run — 79% of the wall clock — so it is pluggable. `sampled` (the default)
+draws ~10^5 points per surface and searches KD-trees; its cost is set by the
+sampling density, which is also what bounds its bias. `bvh` needs the optional
+`python-fcl` and answers the mesh question directly by hierarchy traversal:
+exact, no sampling bias, and it prunes to the geometry near contact instead of
+enumerating points.
+
+Measured on `data/sample.stl`, quick profile, ten recommendations:
+
+| backend | run | per evaluation | agreement |
+|---|---|---|---|
+| `sampled` | 42.0 / 45.8 s | 164 ms | incumbent |
+| `bvh` | 10.1 / 10.2 s | 2.4 ms | 8.9e-16 mm |
+
+Same ten arrangements in the same order; volumes move by at most 0.08% because
+the inner feasibility test gets the true distance instead of a slight
+over-estimate. Select it with `--distance-backend bvh`, the **Distance** menu
+in the UI, or `NEST_DISTANCE_BACKEND=bvh`. Without `python-fcl` installed the
+option disappears from the UI and selecting it fails with an install hint.
+
+**Part A is sampled once per job.** Every candidate measures the same fixed
+part against a differently rotated copy, so `SurfaceSampleCache` holds its
+surface samples and KD-tree for the length of the job — 11 of 42 tree builds
+on a ten-candidate run. The cache lives in thread-local state and is dropped
+when the job ends, and is keyed on mesh content, so an edited mesh cannot hit
+a stale entry.
 
 **Jobs are in-memory.** Restarting the server loses job records, though files
 survive under `data/jobs/`. For production, back `JobStore` with Redis or a
@@ -182,9 +212,11 @@ Environment variables, all optional:
 
 ```
 NEST_DATA_DIR        job artefact directory      (default data/jobs)
-NEST_MAX_UPLOAD_MB   upload size limit           (64)
+NEST_MAX_UPLOAD_MB   upload size limit           (300)
 NEST_MAX_FACES       triangle limit              (400000)
 NEST_JOB_WORKERS     concurrent jobs             (1)
+NEST_KD_WORKERS      cores per KD-tree query     (-1 = all)
+NEST_DISTANCE_BACKEND sampled | bvh              (sampled)
 NEST_JOB_TTL_HOURS   artefact retention          (24)
 NEST_DEFAULT_PROFILE quick | standard | full     (quick)
 NEST_RENDER_DPI      PNG resolution              (110)

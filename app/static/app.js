@@ -18,7 +18,7 @@ dz.addEventListener('drop', e => {
 fileInput.onchange = showName;
 function showName() {
   const f = fileInput.files[0];
-  $('#filehint').textContent = f ? `${f.name} — ${(f.size/1e6).toFixed(1)} MB` : 'Open meshes are repaired automatically. Up to 64 MB.';
+  $('#filehint').textContent = f ? `${f.name} — ${(f.size/1e6).toFixed(1)} MB` : 'Open meshes are repaired automatically. Up to 300 MB.';
 }
 
 $('#upload-form').onsubmit = async (e) => {

@@ -35,6 +35,7 @@ from fastapi.templating import Jinja2Templates
 from starlette.requests import Request
 
 from . import config
+from .core.nesting3d import HAVE_FCL
 from .core.nesting_factory import PROFILES, AlgorithmRegistry
 from .jobs import store, validate_upload
 from .renders import DOWNLOADABLE, VIEWS, render, render_sheet
@@ -56,9 +57,12 @@ def index(request: Request):
         "profiles": sorted(PROFILES),
         "objectives": AlgorithmRegistry.names("objective"),
         "refiners": AlgorithmRegistry.names("refiner"),
+        "backends": [b for b in AlgorithmRegistry.names("distance_backend")
+                     if b != "bvh" or HAVE_FCL],
         "defaults": {"profile": config.DEFAULT_PROFILE,
                      "clearance": config.DEFAULT_CLEARANCE,
-                     "top_n": config.DEFAULT_TOP_N},
+                     "top_n": config.DEFAULT_TOP_N,
+                     "backend": config.DEFAULT_DISTANCE_BACKEND},
     })
 
 
@@ -73,6 +77,7 @@ async def create_job(
     profile: str = Form(config.DEFAULT_PROFILE),
     objective: str = Form("volume"),
     refiner: str = Form("descend"),
+    distance_backend: str = Form(config.DEFAULT_DISTANCE_BACKEND),
 ):
     name = Path(file.filename or "part.stl").name
     if not name.lower().endswith(".stl"):
@@ -83,13 +88,19 @@ async def create_job(
         raise HTTPException(400, "unknown objective")
     if refiner not in AlgorithmRegistry.names("refiner"):
         raise HTTPException(400, "unknown refiner")
+    if distance_backend not in AlgorithmRegistry.names("distance_backend"):
+        raise HTTPException(400, "unknown distance backend")
+    if distance_backend == "bvh" and not HAVE_FCL:
+        raise HTTPException(400, "the bvh distance backend needs python-fcl, "
+                                 "which is not installed on this server")
     if not 1 <= top_n <= 20:
         raise HTTPException(400, "top_n must be between 1 and 20")
     if clearance < 0:
         raise HTTPException(400, "clearance must be positive")
 
     params = {"clearance": clearance, "top_n": top_n, "profile": profile,
-              "objective": objective, "refiner": refiner}
+              "objective": objective, "refiner": refiner,
+              "distance_backend": distance_backend}
     job = store.create(name, params)
     dest = job.dir / name
     with dest.open("wb") as fh:

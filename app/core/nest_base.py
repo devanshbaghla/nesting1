@@ -45,7 +45,7 @@ import trimesh
 from .mesh_repair import MeshRepair, MeshRepairError, RepairReport
 from .nesting3d import (
     Geometry, MeshAudit, NestResult, PairNester, Preview, Refiner,
-    SurfacePairDistance, Validation,
+    SurfacePairDistance, SurfaceSampleCache, Validation,
 )
 from .nesting_factory import (
     AlgorithmRegistry, NesterFactory, NestingConfig, PROFILES,
@@ -86,6 +86,7 @@ class NestingRecommender:
         self.cfg = config or NesterFactory.config("standard")
         self.log_lines: list[str] = []
         self.repair_report: RepairReport | None = None
+        self.sample_cache: SurfaceSampleCache | None = None
 
     def _log(self, msg=""):
         self.log_lines.append(str(msg))
@@ -123,7 +124,9 @@ class NestingRecommender:
     def self_test(self, mesh) -> dict:
         vox = Validation.voxeliser(mesh, self.cfg.fine_pitch,
                                    trials=self.cfg.robustness_trials)
-        sph = Validation.sphere_pair(n=40_000)
+        # gate the metric this run will use, not a fixed one
+        sph = Validation.sphere_pair(n=40_000,
+                                     backend=NesterFactory.backend(self.cfg))
         self._log(f"    voxeliser {100*vox['axis_aligned_error']:+.2f}% axis, "
                   f"{100*vox['rotated']['max_abs']:.2f}% rotated  "
                   f"[{'pass' if vox['pass'] else 'FAIL'}]")
@@ -280,6 +283,13 @@ class NestingRecommender:
         rec.stl = str(path)
 
     def verify_one(self, path: str, full: bool) -> dict:
+        """Re-measure the written STL from scratch.
+
+        The file is re-read from disk rather than trusted, which is what makes
+        this catch an export or transform bug. It uses the configured distance
+        backend: on 'bvh' the sampled/exact split collapses, since one exact
+        answer costs less than the cheap approximation did.
+        """
         chk = trimesh.load(path)
         parts = chk.split(only_watertight=False)
         out = {"bodies": len(parts),
@@ -288,11 +298,13 @@ class NestingRecommender:
                "extents": (chk.bounds[1] - chk.bounds[0]).tolist()}
         if len(parts) == 2:
             n = 250_000 if full else 60_000
-            d = SurfacePairDistance(parts[0], parts[1], np.zeros(3),
-                                    n_samples=n, move=0.0, seed=12345)
-            out["gap"] = float(d.exact(np.zeros(3)) if full
+            backend = NesterFactory.backend(self.cfg)
+            d = backend(parts[0], parts[1], np.zeros(3),
+                        n_samples=n, move=0.0, seed=12345)
+            exact = full or backend is not SurfacePairDistance
+            out["gap"] = float(d.exact(np.zeros(3)) if exact
                                else d.sampled(np.zeros(3)))
-            out["gap_method"] = "exact" if full else "sampled"
+            out["gap_method"] = "exact" if exact else "sampled"
         return out
 
     # -- 7. pareto --------------------------------------------------------- #
@@ -345,6 +357,18 @@ class NestingRecommender:
 
     # -- main -------------------------------------------------------------- #
     def recommend(self, stl_path, out_dir="nest_out", top_n=None) -> list[Recommendation]:
+        """Run the pipeline, reusing part A's samples across every candidate.
+
+        The cache is opened here and nowhere deeper because this is the scope
+        that owns "one part": every candidate below measures the same fixed
+        part A against a differently rotated B, and leaving the block drops the
+        entries so no geometry survives into the next job.
+        """
+        with SurfaceSampleCache() as pool:
+            self.sample_cache = pool
+            return self._recommend(stl_path, out_dir, top_n)
+
+    def _recommend(self, stl_path, out_dir, top_n) -> list[Recommendation]:
         stl_path = Path(stl_path)
         if not stl_path.exists():
             raise FileNotFoundError(stl_path)
@@ -490,6 +514,9 @@ def main(argv=None):
     p.add_argument("-p", "--profile", choices=sorted(PROFILES), default="standard")
     p.add_argument("--objective", choices=sorted(AlgorithmRegistry.names("objective")),
                    default="volume")
+    p.add_argument("--distance-backend",
+                   choices=sorted(AlgorithmRegistry.names("distance_backend")),
+                   help="sampled (default) or bvh (needs python-fcl)")
     p.add_argument("--refiner", choices=sorted(AlgorithmRegistry.names("refiner")))
     p.add_argument("--coarse-pitch", type=float)
     p.add_argument("--fine-pitch", type=float)
@@ -508,11 +535,16 @@ def main(argv=None):
     if not a.stl:
         p.error("an STL path is required (or use --describe)")
 
-    cfg = NesterFactory.config(
-        a.profile, clearance=a.clearance, objective=a.objective,
-        refiner=a.refiner, coarse_pitch=a.coarse_pitch, fine_pitch=a.fine_pitch,
-        n_samples=a.n_samples, repair=a.repair, top_n=a.top,
-        verbose=not a.quiet)
+    try:
+        cfg = NesterFactory.config(
+            a.profile, clearance=a.clearance, objective=a.objective,
+            refiner=a.refiner, coarse_pitch=a.coarse_pitch,
+            fine_pitch=a.fine_pitch, n_samples=a.n_samples, repair=a.repair,
+            top_n=a.top, distance_backend=a.distance_backend,
+            verbose=not a.quiet)
+    except RuntimeError as exc:              # e.g. bvh selected without fcl
+        print(f"\n{exc}", file=sys.stderr)
+        return 2
     try:
         NestingRecommender(cfg).recommend(a.stl, a.out_dir, a.top)
     except MeshRepairError as exc:
