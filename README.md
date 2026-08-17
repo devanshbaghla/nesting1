@@ -13,16 +13,19 @@ top / bottom / front views, and the nested STL.
 
 ```bash
 git clone <this repo> && cd nesting-app
-./run.sh                       # creates .venv, installs, serves on :8000
+pip install -r requirements.txt
+python app.py                  # serves on http://localhost:8000
 ```
-
-Then open <http://localhost:8000>. Or manually:
 
 ```bash
-python3 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-uvicorn app.main:app --reload
+python app.py --port 8080      # any other port
+python app.py --host 0.0.0.0   # reachable from other machines
+python app.py --reload --open  # restart on edits, open a browser
+python app.py --help           # all options
 ```
+
+On Linux/macOS, `./run.sh` does the same thing but creates `.venv` and
+installs dependencies first. Any arguments are passed through to `app.py`.
 
 Command line, no server:
 
