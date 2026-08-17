@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>STL Nesting — top arrangements</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header>
+  <h1>STL Nesting</h1>
+  <p class="sub">Two copies of your part, arranged for minimum bounding box, with a guaranteed minimum surface clearance.</p>
+</header>
+
+<main>
+  <section class="panel" id="upload-panel">
+    <form id="upload-form">
+      <div class="dropzone" id="dropzone">
+        <input type="file" id="file" name="file" accept=".stl" hidden>
+        <p><strong>Drop an STL here</strong> or <button type="button" id="browse" class="link">browse</button></p>
+        <p class="hint" id="filehint">Must be watertight. Up to 64 MB.</p>
+      </div>
+
+      <div class="grid-opts">
+        <label>Clearance (file units)
+          <input type="number" name="clearance" value="{{ defaults.clearance }}" step="0.1" min="0">
+        </label>
+        <label>Recommendations
+          <input type="number" name="top_n" value="{{ defaults.top_n }}" min="1" max="20">
+        </label>
+        <label>Profile
+          <select name="profile">
+            {% for p in profiles %}<option value="{{ p }}" {% if p == defaults.profile %}selected{% endif %}>{{ p }}</option>{% endfor %}
+          </select>
+        </label>
+        <label>Rank by
+          <select name="objective">
+            {% for o in objectives %}<option value="{{ o }}">{{ o }}</option>{% endfor %}
+          </select>
+        </label>
+        <label>Refinement
+          <select name="refiner">
+            {% for r in refiners %}<option value="{{ r }}" {% if r == 'descend' %}selected{% endif %}>{{ r }}</option>{% endfor %}
+          </select>
+        </label>
+      </div>
+      <p class="note">
+        <strong>quick</strong> ~1–3 min · <strong>standard</strong> ~10 min · <strong>full</strong> adds a 744-orientation sweep.
+        Refinement <strong>none</strong> is fastest but leaves gaps looser than requested; <strong>profile</strong> squeezes closest.
+      </p>
+      <button type="submit" id="submit">Nest it</button>
+    </form>
+  </section>
+
+  <section class="panel hidden" id="progress-panel">
+    <h2>Working <span class="spinner"></span></h2>
+    <div class="bar"><div class="bar-fill" id="bar"></div></div>
+    <p id="stage" class="stage">queued</p>
+    <pre id="log"></pre>
+  </section>
+
+  <section class="panel hidden" id="error-panel">
+    <h2>Could not process this file</h2>
+    <p id="error-msg"></p>
+    <button type="button" id="retry">Try another file</button>
+  </section>
+
+  <section class="hidden" id="results">
+    <div class="results-head">
+      <h2>Recommendations</h2>
+      <div>
+        <a id="dl-all" class="btn ghost" href="#">Download all</a>
+        <button type="button" id="again" class="btn ghost">New part</button>
+      </div>
+    </div>
+    <p class="legend"><span class="pareto-dot"></span> Pareto-optimal — not beaten on both volume and footprint. Others are shown for comparison.</p>
+    <table id="summary"><thead><tr>
+      <th>#</th><th>Bounding box (mm)</th><th>Volume (mm³)</th><th>Footprint (mm²)</th><th>Height</th><th>Gap</th><th></th>
+    </tr></thead><tbody></tbody></table>
+    <div class="cards" id="cards"></div>
+  </section>
+</main>
+
+<div class="modal hidden" id="modal">
+  <div class="modal-inner">
+    <button class="close" id="modal-close">&times;</button>
+    <h3 id="modal-title"></h3>
+    <div class="views" id="modal-views"></div>
+    <div class="modal-actions">
+      <a class="btn" id="modal-zip" href="#">Download top / bottom / front (ZIP)</a>
+      <a class="btn ghost" id="modal-stl" href="#">Download STL</a>
+    </div>
+  </div>
+</div>
+
+<footer><p>Engine: exact scanline voxelisation → FFT translation search → continuous refinement against exact point-to-triangle distance. <a href="/docs">API docs</a> · <a href="/api/algorithms">algorithms</a></p></footer>
+<script src="/static/app.js"></script>
+</body>
+</html>
