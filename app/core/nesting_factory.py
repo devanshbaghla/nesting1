@@ -29,8 +29,8 @@ import trimesh
 
 from .nesting3d import (
     HAVE_FCL, BVHPairDistance, ClearanceGrid, Geometry, MeshAudit,
-    OrientationSet, Preview, Refiner, ScanlineVoxelizer, SurfacePairDistance,
-    TranslationOracle, Validation,
+    OrientationSet, Preview, Refiner, ScanlineVoxelizer, SurfaceDistanceField,
+    SurfacePairDistance, SurfaceSampleCache, TranslationOracle, Validation,
 )
 
 __all__ = ["AlgorithmRegistry", "NestingConfig", "NesterFactory", "OBJECTIVES"]
@@ -329,8 +329,17 @@ class NesterFactory:
     @staticmethod
     def distance(meshA, meshB, t_ref, cfg: NestingConfig,
                  n_samples: int | None = None):
-        return NesterFactory.backend(cfg)(meshA, meshB, t_ref,
-                                          n_samples or cfg.n_samples)
+        backend = NesterFactory.backend(cfg)
+        if backend is not SurfacePairDistance:
+            # BVH answers by hierarchy traversal; there is no KD query to prune
+            return backend(meshA, meshB, t_ref, n_samples or cfg.n_samples)
+        # the fine sweep's ClearanceGrid already ran this distance transform
+        # and left it in the job's cache; a miss simply means no pruning
+        pool = SurfaceSampleCache.current()
+        field = (pool.field_for(meshA, cfg.fine_pitch)
+                 if pool is not None else None)
+        return backend(meshA, meshB, t_ref, n_samples or cfg.n_samples,
+                       field=field)
 
     @staticmethod
     def metric(cfg: NestingConfig) -> Callable:
