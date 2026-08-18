@@ -328,7 +328,7 @@ class NesterFactory:
 
     @staticmethod
     def distance(meshA, meshB, t_ref, cfg: NestingConfig,
-                 n_samples: int | None = None):
+                 n_samples: int | None = None, transform=None):
         backend = NesterFactory.backend(cfg)
         if backend is not SurfacePairDistance:
             # BVH answers by hierarchy traversal; there is no KD query to prune
@@ -338,8 +338,34 @@ class NesterFactory:
         pool = SurfaceSampleCache.current()
         field = (pool.field_for(meshA, cfg.fine_pitch)
                  if pool is not None else None)
+        field_b = NesterFactory._field_for_b(field, meshA, meshB, transform)
         return backend(meshA, meshB, t_ref, n_samples or cfg.n_samples,
-                       field=field)
+                       field=field, field_b=field_b)
+
+    @staticmethod
+    def _field_for_b(field, meshA, meshB, transform):
+        """A's field placed on B, when B really is A moved by ``transform``.
+
+        Callers pass ``meshB`` and the transform separately, so nothing stops
+        the two disagreeing. A field sitting where the geometry is not would
+        exclude points that do hold the minimum and hand back a distance that
+        is too large, so the claim is checked against the geometry instead of
+        taken on faith — cheap next to the queries it saves, and a mismatch
+        only costs the pruning.
+        """
+        if field is None or transform is None:
+            return None
+        if len(meshA.faces) != len(meshB.faces):
+            return None
+        want = trimesh.transform_points(meshA.triangles.mean(axis=1),
+                                        np.asarray(transform, float))
+        tol = 1e-6 * max(1.0, float(np.max(meshA.extents)))
+        if np.abs(want - meshB.triangles.mean(axis=1)).max() > tol:
+            return None
+        try:
+            return field.transformed(transform)
+        except ValueError:                     # not a rigid motion
+            return None
 
     @staticmethod
     def metric(cfg: NestingConfig) -> Callable:

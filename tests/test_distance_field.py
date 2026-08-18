@@ -373,6 +373,151 @@ def test_field_b_alone_is_allowed():
     assert plain.exact(np.zeros(3)) == b_only.exact(np.zeros(3))
 
 
+# --------------------------------------------------------------------------- #
+#  exact() under the filter
+# --------------------------------------------------------------------------- #
+def _stack(mesh, gap):
+    M = trimesh.transformations.rotation_matrix(np.pi, [1, 0, 0])
+    M[:3, 3] = [0.0, 0.0, float(mesh.extents[2]) + gap]
+    return M
+
+
+def _three_ways(mesh, M, move=6.0):
+    """The same pair built with no field, A's field, and both fields."""
+    mB = mesh.copy(); mB.apply_transform(M)
+    fa = _field(mesh, margin=14.0)
+    fb = fa.transformed(M)
+    with SurfaceSampleCache():
+        return (SurfacePairDistance(mesh, mB, np.zeros(3), n_samples=N, move=move),
+                SurfacePairDistance(mesh, mB, np.zeros(3), n_samples=N, move=move,
+                                    field=fa),
+                SurfacePairDistance(mesh, mB, np.zeros(3), n_samples=N, move=move,
+                                    field=fa, field_b=fb))
+
+
+def test_exact_is_identical_on_both_sides():
+    """The number shipped to the user must not move by a single bit."""
+    mesh = _part()
+    plain, a_only, both = _three_ways(mesh, _stack(mesh, 6.0))
+    for i in range(15):
+        t = np.array([0.3 * np.sin(i), 0.5 * np.cos(i), -0.4 * i])
+        want = plain.exact(t)
+        assert a_only.exact(t) == want, f"A-side filter moved exact() at {t}"
+        assert both.exact(t) == want, f"B-side filter moved exact() at {t}"
+
+
+def test_exact_is_identical_at_contact():
+    """Where the band is thinnest and the filter keeps the most."""
+    mesh = _part()
+    M = _stack(mesh, 0.0)
+    plain, a_only, both = _three_ways(mesh, M, move=0.0)
+    for dz in (0.0, -0.05, 0.05, -0.2):
+        t = np.array([0.0, 0.0, dz])
+        want = plain.exact(t)
+        assert a_only.exact(t) == want, dz
+        assert both.exact(t) == want, dz
+
+
+def test_exact_is_identical_at_every_band():
+    """`band` widens the selection; the filter must track it, not a constant."""
+    mesh = _part()
+    plain, _, both = _three_ways(mesh, _stack(mesh, 6.0))
+    t = np.array([0.0, 0.0, -1.0])
+    for band in (0.0, 0.3, 0.8, 2.0, 8.0):
+        assert both.exact(t, band=band) == plain.exact(t, band=band), band
+
+
+def test_exact_is_identical_for_every_k():
+    mesh = _part()
+    plain, _, both = _three_ways(mesh, _stack(mesh, 6.0))
+    t = np.array([0.0, 0.0, -1.0])
+    for k in (4, 12, 24, 48):
+        assert both.exact(t, k=k) == plain.exact(t, k=k), k
+
+
+def test_a_coarse_field_does_not_move_exact():
+    """Field accuracy changes how much is pruned, never the result."""
+    mesh = _part()
+    M = _stack(mesh, 6.0)
+    mB = mesh.copy(); mB.apply_transform(M)
+    t = np.array([0.0, 0.0, -1.0])
+    with SurfaceSampleCache():
+        plain = SurfacePairDistance(mesh, mB, np.zeros(3), n_samples=N)
+        want = plain.exact(t)
+        for pitch in (2.0, 1.0, 0.5):
+            fa = _field(mesh, pitch=pitch, margin=14.0)
+            got = SurfacePairDistance(mesh, mB, np.zeros(3), n_samples=N,
+                                      field=fa, field_b=fa.transformed(M))
+            assert got.exact(t) == want, pitch
+
+
+def test_exact_still_beats_the_sampled_bound():
+    """Sanity that the filter did not turn exact() into the sampled metric."""
+    mesh = _part()
+    _, _, both = _three_ways(mesh, _stack(mesh, 6.0))
+    t = np.array([0.0, 0.0, -1.0])
+    assert both.exact(t) <= both.sampled(t) + 1e-12
+
+
+# --------------------------------------------------------------------------- #
+#  the factory only lends B a field when B really is A moved
+# --------------------------------------------------------------------------- #
+def test_factory_supplies_b_a_field_for_a_true_placement():
+    from app.core.nesting_factory import NesterFactory
+
+    mesh = _part()
+    M = _stack(mesh, 6.0)
+    mB = mesh.copy(); mB.apply_transform(M)
+    cfg = NesterFactory.config("quick", verbose=False)
+    with SurfaceSampleCache() as pool:
+        pool.publish_field(mesh, cfg.fine_pitch, _field(mesh, pitch=cfg.fine_pitch))
+        d = NesterFactory.distance(mesh, mB, np.zeros(3), cfg, n_samples=N,
+                                   transform=M)
+    assert d.field is not None and d.field_b is not None
+
+
+def test_factory_refuses_a_transform_that_does_not_match():
+    """A wrong claim must cost the pruning, not the answer."""
+    from app.core.nesting_factory import NesterFactory
+
+    mesh = _part()
+    mB = mesh.copy(); mB.apply_transform(_stack(mesh, 6.0))
+    cfg = NesterFactory.config("quick", verbose=False)
+    with SurfaceSampleCache() as pool:
+        pool.publish_field(mesh, cfg.fine_pitch, _field(mesh, pitch=cfg.fine_pitch))
+        lying = _stack(mesh, 25.0)
+        d = NesterFactory.distance(mesh, mB, np.zeros(3), cfg, n_samples=N,
+                                   transform=lying)
+        plain = NesterFactory.distance(mesh, mB, np.zeros(3), cfg, n_samples=N)
+    assert d.field_b is None, "a mismatched placement must not lend B a field"
+    assert d.exact(np.zeros(3)) == plain.exact(np.zeros(3))
+
+
+def test_factory_refuses_a_non_rigid_transform():
+    from app.core.nesting_factory import NesterFactory
+
+    mesh = _part()
+    mB = mesh.copy(); mB.apply_transform(_stack(mesh, 6.0))
+    cfg = NesterFactory.config("quick", verbose=False)
+    with SurfaceSampleCache() as pool:
+        pool.publish_field(mesh, cfg.fine_pitch, _field(mesh, pitch=cfg.fine_pitch))
+        d = NesterFactory.distance(mesh, mB, np.zeros(3), cfg, n_samples=N,
+                                   transform=np.diag([2.0, 1.0, 1.0, 1.0]))
+    assert d.field_b is None
+
+
+def test_factory_without_a_transform_is_the_old_path():
+    from app.core.nesting_factory import NesterFactory
+
+    mesh = _part()
+    mB = mesh.copy(); mB.apply_transform(_stack(mesh, 6.0))
+    cfg = NesterFactory.config("quick", verbose=False)
+    with SurfaceSampleCache() as pool:
+        pool.publish_field(mesh, cfg.fine_pitch, _field(mesh, pitch=cfg.fine_pitch))
+        d = NesterFactory.distance(mesh, mB, np.zeros(3), cfg, n_samples=N)
+    assert d.field is not None and d.field_b is None
+
+
 if __name__ == "__main__":
     for name, fn in sorted(list(globals().items())):
         if name.startswith("test_"):

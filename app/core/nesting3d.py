@@ -827,7 +827,7 @@ class SurfacePairDistance:
     #: 32 seeds keep 12% at contact and under 2% well separated.
     _SEEDS = 32
 
-    def min_distance_to(self, tree, points, field) -> float:
+    def min_distance_to(self, tree, points, field, lb=None) -> float:
         """``tree.query(points).min()``, with most of the points ruled out first.
 
         Exact, not approximate. The field gives a lower bound ``lb`` on every
@@ -841,12 +841,16 @@ class SurfacePairDistance:
 
         Falls back to the plain query with no field, on a tiny cloud where the
         gather would not pay, or when the filter rules nothing out.
+
+        ``lb`` lets a caller that already gathered the bound pass it in rather
+        than pay for it twice; :meth:`exact` needs the same bound for its
+        minimum and for its selection.
         """
         points = np.asarray(points, float)
         if field is None or len(points) <= self._SEEDS:
             return float(tree.query(points, workers=KD_WORKERS)[0].min())
 
-        lb = field.lower_bound(points)
+        lb = field.lower_bound(points) if lb is None else lb
         seeds = np.argpartition(lb, self._SEEDS)[:self._SEEDS]
         upper = float(tree.query(points[seeds], workers=KD_WORKERS)[0].min())
         keep = lb <= upper
@@ -875,20 +879,21 @@ class SurfacePairDistance:
         band = self.min_distance_to(tree, points, field) + 2.0 * move + 1.0
         return self.mask_within(tree, points, band, field), band
 
-    def mask_within(self, tree, points, band: float, field):
+    def mask_within(self, tree, points, band: float, field, lb=None):
         """``tree.query(points) <= band``, computing distances only where it can hold.
 
         A point whose lower bound already exceeds the band cannot have a true
         distance inside it, so it is False without being queried. The mask
         equals the one a full query produces; only the count of descents falls,
         and it falls furthest when the band is tight — the constructor's
-        ``move=0`` case narrows it to a millimetre.
+        ``move=0`` case narrows it to a millimetre, and :meth:`exact` narrows
+        it to 0.8 mm.
         """
         points = np.asarray(points, float)
         if field is None:
             d, _ = tree.query(points, workers=KD_WORKERS)
             return d <= band
-        candidate = field.lower_bound(points) <= band
+        candidate = (field.lower_bound(points) if lb is None else lb) <= band
         mask = np.zeros(len(points), bool)
         if candidate.any():
             d, _ = tree.query(points[candidate], workers=KD_WORKERS)
@@ -902,13 +907,33 @@ class SurfacePairDistance:
                                     self.field)
 
     def exact(self, t, k: int = 24, band: float = 0.8) -> float:
+        """Minimum surface distance with B translated by ``t``.
+
+        Unchanged in what it computes. The sampled minimum still localises the
+        near-contact band and the answer still comes from true point-to-triangle
+        distances there; the fields only decide which points are worth a tree
+        descent, and they can only exclude a point whose lower bound already
+        exceeds the threshold it would have been tested against. The selection
+        and the returned distance are the ones the unfiltered code produced.
+
+        This is the tightest band in the pipeline — 0.8 mm against the
+        constructor's 13 mm — so it is also where the filter discards most:
+        measured, it keeps about a sixth of each cloud.
+        """
         t = np.asarray(t, float)
-        d, _ = self.treeA.query(self.qB + t, workers=KD_WORKERS)
-        best = float(d.min())
-        sel = self.qB[d <= best + band] + t
+
+        ptsB = self.qB + t
+        # one gather serves both the minimum and the selection below it
+        lbB = None if self.field is None else self.field.lower_bound(ptsB)
+        best = self.min_distance_to(self.treeA, ptsB, self.field, lb=lbB)
+        sel = ptsB[self.mask_within(self.treeA, ptsB, best + band,
+                                    self.field, lb=lbB)]
         best = min(best, self._pt_tri(sel, self.treeA, self.fA, self.triA, k))
-        d, _ = self.treeB.query(self.qA - t, workers=KD_WORKERS)
-        sel = self.qA[d <= best + band] - t
+
+        # the B side is thresholded against the running best, which the A-side
+        # triangle pass may just have lowered — so it needs no minimum of its own
+        ptsA = self.qA - t
+        sel = ptsA[self.mask_within(self.treeB, ptsA, best + band, self.field_b)]
         best = min(best, self._pt_tri(sel, self.treeB, self.fB, self.triB, k))
         return best
 

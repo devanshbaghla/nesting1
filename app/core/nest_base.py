@@ -242,7 +242,10 @@ class NestingRecommender:
         strategy = NesterFactory.strategy(self.cfg)
         mB = mesh.copy(); mB.apply_transform(T)
         n = self.cfg.n_samples if strategy != "none" else 80_000
-        dist = NesterFactory.distance(mesh, mB, t0, self.cfg, n_samples=n)
+        # T is handed over so B's side of the distance queries can borrow A's
+        # field through it; the factory checks that mB really is mesh moved by T
+        dist = NesterFactory.distance(mesh, mB, t0, self.cfg, n_samples=n,
+                                      transform=T)
         metric = NesterFactory.metric(self.cfg)
 
         if strategy == "none":
