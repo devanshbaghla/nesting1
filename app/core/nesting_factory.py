@@ -233,6 +233,12 @@ class NestingConfig:
     #: attempt automatic repair when the input mesh is not a closed solid.
     #: Watertight input never reaches the repair path, so this is inert for it.
     repair: bool = True
+    #: drop disconnected debris before nesting. A single-body mesh never
+    #: reaches the check, so this is inert for it.
+    denoise: bool = True
+    #: a fragment is debris below this share of the main fragment's bbox
+    #: diagonal. Deliberately timid: a real two-piece assembly keeps both.
+    denoise_ratio: float = 0.05
     origin_corner: bool = True
     verbose: bool = True
 

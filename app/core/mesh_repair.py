@@ -44,7 +44,122 @@ from dataclasses import asdict, dataclass, field
 import numpy as np
 import trimesh
 
-__all__ = ["MeshRepairError", "RepairReport", "MeshRepair"]
+__all__ = ["MeshRepairError", "RepairReport", "MeshRepair",
+           "DenoiseReport", "MeshDenoise"]
+
+
+@dataclass
+class DenoiseReport:
+    """Which disconnected fragments were dropped, and what that bought."""
+
+    components_before: int = 1
+    components_after: int = 1
+    dropped: list = field(default_factory=list)
+    faces_before: int = 0
+    faces_after: int = 0
+    extents_before: list = field(default_factory=list)
+    extents_after: list = field(default_factory=list)
+
+    @property
+    def changed(self) -> bool:
+        return bool(self.dropped)
+
+    def bbox_shrink(self) -> float:
+        """Fraction of the bounding box the strays were responsible for."""
+        before = float(np.prod(self.extents_before)) if self.extents_before else 0.0
+        after = float(np.prod(self.extents_after)) if self.extents_after else 0.0
+        return 0.0 if before <= 0 else max(0.0, 1.0 - after / before)
+
+    def summary(self) -> str:
+        if not self.changed:
+            return "no stray fragments found"
+        shrink = self.bbox_shrink()
+        note = (f", bounding box down {100 * shrink:.1f}%"
+                if shrink > 1e-6 else ", bounding box unchanged")
+        return (f"dropped {len(self.dropped)} stray "
+                f"{'fragment' if len(self.dropped) == 1 else 'fragments'} "
+                f"({self.faces_before - self.faces_after:,} faces){note}")
+
+    def to_dict(self) -> dict:
+        d = asdict(self)
+        d["changed"] = self.changed
+        d["bbox_shrink"] = self.bbox_shrink()
+        d["summary"] = self.summary()
+        return d
+
+
+class MeshDenoise:
+    """Remove disconnected fragments that are not part of the object.
+
+    Scanned and converted STLs routinely carry debris: a few triangles left
+    behind by a boolean, a speck of scanner noise, a duplicate shell offset
+    from the part. None of it is visible at a glance and none of it stops the
+    mesh being watertight, so it survives every check in :class:`MeshRepair`.
+
+    It still ruins the answer. Every number this pipeline reports —  bounding
+    volume, footprint, the axis leverage that decides which axis to bisect —
+    is measured against the axis-aligned box around the geometry. One stray
+    triangle sitting 200 mm off the part stretches that box by 200 mm, and the
+    nesting is then optimised for a shape that is mostly empty air. The failure
+    is silent: the arrangement is still feasible, still meets the clearance,
+    and is simply far worse than it should be.
+
+    A fragment is treated as debris when its bounding-box diagonal is under
+    ``ratio`` of the largest fragment's — physical size, which is what the
+    bounding box actually responds to, rather than volume, which is undefined
+    for the open shells debris often is. The default 5% is deliberately timid:
+    a genuine two-piece assembly exported as one file keeps both pieces.
+    """
+
+    #: fragment is debris below this share of the main fragment's bbox diagonal
+    DIAGONAL_RATIO = 0.05
+
+    @classmethod
+    def strip_stray_shells(cls, mesh: trimesh.Trimesh, *, ratio: float = None,
+                           log=None) -> tuple[trimesh.Trimesh, DenoiseReport]:
+        """Return ``(mesh, report)``, dropping debris fragments.
+
+        A single-body mesh is returned untouched without splitting anything,
+        which is the common case and costs one cached lookup.
+        """
+        ratio = cls.DIAGONAL_RATIO if ratio is None else ratio
+        report = DenoiseReport(
+            faces_before=int(len(mesh.faces)), faces_after=int(len(mesh.faces)),
+            extents_before=[float(v) for v in mesh.extents],
+            extents_after=[float(v) for v in mesh.extents])
+
+        if mesh.body_count <= 1:
+            return mesh, report
+
+        parts = mesh.split(only_watertight=False)
+        report.components_before = report.components_after = len(parts)
+        if len(parts) <= 1:
+            return mesh, report
+
+        diagonals = [float(np.linalg.norm(p.extents)) for p in parts]
+        largest = max(diagonals)
+        if largest <= 0:
+            return mesh, report
+
+        keep, dropped = [], []
+        for part, diag in zip(parts, diagonals):
+            if diag >= ratio * largest:
+                keep.append(part)
+            else:
+                dropped.append({"faces": int(len(part.faces)),
+                                "diagonal": round(diag, 4),
+                                "share_of_part": round(diag / largest, 6)})
+        if not dropped or not keep:
+            return mesh, report
+
+        out = keep[0] if len(keep) == 1 else trimesh.util.concatenate(keep)
+        report.dropped = dropped
+        report.components_after = len(keep)
+        report.faces_after = int(len(out.faces))
+        report.extents_after = [float(v) for v in out.extents]
+        if log:
+            log(f"    {report.summary()}")
+        return out, report
 
 
 class MeshRepairError(ValueError):

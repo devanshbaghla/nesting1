@@ -42,7 +42,8 @@ from pathlib import Path
 import numpy as np
 import trimesh
 
-from .mesh_repair import MeshRepair, MeshRepairError, RepairReport
+from .mesh_repair import (DenoiseReport, MeshDenoise, MeshRepair,
+                          MeshRepairError, RepairReport)
 from .nesting3d import (
     Geometry, MeshAudit, NestResult, PairNester, Preview, Refiner,
     SurfacePairDistance, SurfaceSampleCache, Validation,
@@ -86,6 +87,7 @@ class NestingRecommender:
         self.cfg = config or NesterFactory.config("standard")
         self.log_lines: list[str] = []
         self.repair_report: RepairReport | None = None
+        self.denoise_report: DenoiseReport | None = None
         self.sample_cache: SurfaceSampleCache | None = None
 
     def _log(self, msg=""):
@@ -108,6 +110,10 @@ class NestingRecommender:
         mesh = trimesh.load(path, force="mesh")
         if isinstance(mesh, trimesh.Scene):
             mesh = mesh.dump(concatenate=True)
+        if self.cfg.denoise:
+            # before the repair, so hole filling never tries to close a speck
+            mesh, self.denoise_report = MeshDenoise.strip_stray_shells(
+                mesh, ratio=self.cfg.denoise_ratio, log=self._log)
         mesh, self.repair_report = MeshRepair.ensure_solid(
             mesh, allow_repair=self.cfg.repair, log=self._log)
         return mesh
@@ -468,6 +474,7 @@ class NestingRecommender:
         payload = {
             "input": str(stl_path),
             "config": self.cfg.to_dict(),
+            "denoise": self.denoise_report.to_dict() if self.denoise_report else None,
             "repair": self.repair_report.to_dict() if self.repair_report else None,
             "audit": audit,
             "self_tests": tests,

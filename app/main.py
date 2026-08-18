@@ -113,6 +113,9 @@ async def create_job(
         raise HTTPException(422, str(exc)) from exc
 
     job.audit = stats
+    if stats.get("denoised"):
+        job.log.append(f"input mesh carried loose fragments; "
+                       f"{stats['denoise']['summary']}")
     if stats.get("repaired"):
         # the nested output is derived from the repaired solid, not the file
         # that was uploaded — say so where the user is already looking

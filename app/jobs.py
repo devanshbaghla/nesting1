@@ -24,7 +24,8 @@ import numpy as np
 import trimesh
 
 from . import config
-from .core.mesh_repair import MeshRepair, MeshRepairError
+from .core.mesh_repair import (DenoiseReport, MeshDenoise, MeshRepair,
+                               MeshRepairError)
 from .core.nest_base import NestingRecommender
 from .core.nesting_factory import NesterFactory
 from .renders import render
@@ -184,14 +185,16 @@ class _WebRecommender(NestingRecommender):
                                      tests, baselines)
 
 
-def validate_upload(path: Path, repair: bool = True) -> dict:
+def validate_upload(path: Path, repair: bool = True,
+                    denoise: bool = True) -> dict:
     """Reject unusable uploads before a worker slot is spent on them.
 
-    An open mesh is repaired here rather than at the start of the job, and the
-    repaired solid is written back over the uploaded copy. Two reasons: the
-    user learns about it in the upload response instead of minutes later in a
-    failed job, and the worker then loads a mesh that needs no repair — one
-    repair per upload, and the STL on disk matches the results derived from it.
+    Disconnected debris is stripped and an open mesh is repaired here rather
+    than at the start of the job, and the cleaned solid is written back over
+    the uploaded copy. Two reasons: the user learns about it in the upload
+    response instead of minutes later in a failed job, and the worker then
+    loads a mesh that needs no work — one clean-up per upload, and the STL on
+    disk matches the results derived from it.
 
     :raises ValueError: unusable file. ``MeshRepairError`` is a ``ValueError``,
         so an unrepairable mesh surfaces through the same 422 as the rest.
@@ -207,12 +210,15 @@ def validate_upload(path: Path, repair: bool = True) -> dict:
         mesh = mesh.dump(concatenate=True)
     if not hasattr(mesh, "faces") or len(mesh.faces) == 0:
         raise ValueError("no triangles found in the file")
-    if len(mesh.faces) > config.MAX_FACES:
+    if config.MAX_FACES and len(mesh.faces) > config.MAX_FACES:
         raise ValueError(f"{len(mesh.faces):,} faces exceeds the "
                          f"{config.MAX_FACES:,} limit; decimate first")
 
+    noise = DenoiseReport()
+    if denoise:
+        mesh, noise = MeshDenoise.strip_stray_shells(mesh)
     mesh, report = MeshRepair.ensure_solid(mesh, allow_repair=repair)
-    if report.repaired:
+    if report.repaired or noise.changed:
         mesh.export(str(path))
 
     return {"faces": int(len(mesh.faces)),
@@ -220,7 +226,9 @@ def validate_upload(path: Path, repair: bool = True) -> dict:
             "volume": round(float(mesh.volume), 1),
             "fill_ratio": round(float(mesh.volume / np.prod(mesh.extents)), 4),
             "repaired": bool(report.repaired),
-            "repair": report.to_dict()}
+            "repair": report.to_dict(),
+            "denoised": bool(noise.changed),
+            "denoise": noise.to_dict()}
 
 
 store = JobStore()

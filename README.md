@@ -129,6 +129,26 @@ Pareto are not beaten on both volume *and* footprint simultaneously.
 
 ## Things worth knowing
 
+**Loose fragments are stripped first.** Scanned and converted STLs arrive with
+debris — a few triangles left by a boolean, a speck of scanner noise, a
+duplicate shell offset from the part. It is not an error and nothing rejects
+it: the mesh stays watertight and every check passes. What it does is stretch
+the axis-aligned box that every reported number is measured against, so the
+nesting silently optimises for mostly empty air. In one test three 0.5 mm
+specks inflated the bounding box **38.8x**.
+
+A fragment counts as debris when its bounding-box diagonal is under 5% of the
+largest fragment's — physical size, because that is what the bounding box
+responds to, rather than volume, which is undefined for the open shells debris
+often is. The threshold is deliberately timid, so a genuine two-piece assembly
+exported as one file keeps both pieces. Tune with `denoise_ratio`, disable with
+`denoise=False`.
+
+**No triangle ceiling.** `NEST_MAX_FACES` defaults to 0, meaning uploads are
+never rejected for face count. Cost scales with it across sampling,
+rasterisation and BVH construction, so a multi-million-face part is slow rather
+than refused — set the variable to a positive number to restore a hard limit.
+
 **Open meshes are repaired, then verified.** Solid voxelisation by parity is
 undefined for an open surface — on a column that sees a hole the fill runs past
 the boundary and returns a wrong solid with no error at all. So an upload that
@@ -213,7 +233,7 @@ Environment variables, all optional:
 ```
 NEST_DATA_DIR        job artefact directory      (default data/jobs)
 NEST_MAX_UPLOAD_MB   upload size limit           (300)
-NEST_MAX_FACES       triangle limit              (400000)
+NEST_MAX_FACES       triangle limit, 0 = none    (0)
 NEST_JOB_WORKERS     concurrent jobs             (1)
 NEST_KD_WORKERS      cores per KD-tree query     (-1 = all)
 NEST_DISTANCE_BACKEND sampled | bvh              (sampled)
