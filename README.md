@@ -208,11 +208,19 @@ branch-and-bound over placement order.
 pinned at identity, so global rotations of the pair are not searched. The
 honest claim is "best found by a well-covered search."
 
-**Single worker by default.** A job already spreads its own KD-tree queries
-across every core (`NEST_KD_WORKERS`, `-1` by default — worth ~3x on the whole
-run), so concurrent jobs mostly contend for the same cores. Jobs queue. If you
-raise `NEST_JOB_WORKERS`, cap `NEST_KD_WORKERS` to match or the jobs will
-oversubscribe each other.
+**The engine is single-threaded, and that costs ~1.6x.** KD-tree queries used
+to fan out across every core. Measured on the reference part's `quick` profile,
+the fan-out is worth 24.7 s against 39.1 s serial — results identical to the
+digit either way, so this was never a correctness question.
+
+It is off anyway. Under a profiler the fan-out charges its time to
+`_thread.lock.acquire` rather than to the function that caused it, which made
+88% of a profile unattributable and hid where the work actually was; every
+optimisation in the distance path was found only after turning it off. And one
+job now uses one core, so `NEST_JOB_WORKERS` above 1 scales cleanly instead of
+having each job contend with the others for the same cores. If you want the
+1.6x back on a single-job machine, set `KD_WORKERS = -1` in
+`app/core/nesting3d.py`.
 
 **Two distance backends.** The surface-to-surface distance is the whole cost of
 a run — 79% of the wall clock — so it is pluggable. `sampled` (the default)
@@ -257,7 +265,6 @@ NEST_DATA_DIR        job artefact directory      (default data/jobs)
 NEST_MAX_UPLOAD_MB   upload size limit           (300)
 NEST_MAX_FACES       triangle limit, 0 = none    (0)
 NEST_JOB_WORKERS     concurrent jobs             (1)
-NEST_KD_WORKERS      cores per KD-tree query     (-1 = all)
 NEST_DISTANCE_BACKEND sampled | bvh              (sampled)
 NEST_JOB_TTL_HOURS   artefact retention          (24)
 NEST_DEFAULT_PROFILE quick | standard | full     (quick)

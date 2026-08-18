@@ -62,7 +62,6 @@ Pitfalls this code already handles (each cost a debugging cycle):
 from __future__ import annotations
 
 import json
-import os
 import threading
 from dataclasses import dataclass, field
 from typing import Callable, Iterable, Sequence
@@ -93,13 +92,25 @@ __all__ = [
 #: Whether the BVH distance backend can be selected on this install.
 HAVE_FCL = fcl is not None
 
-#: Cores used for ``cKDTree.query``. SciPy defaults to one; every query in
-#: :class:`SurfacePairDistance` is over ~10^5 independent points, so splitting
-#: them is free parallelism — measured 5.5x on a 10-core machine, with results
-#: identical to the digit. Set ``NEST_KD_WORKERS`` to cap it: running several
-#: jobs at once (``NEST_JOB_WORKERS`` above 1) makes -1 oversubscribe, since
-#: each job would claim every core.
-KD_WORKERS = int(os.getenv("NEST_KD_WORKERS", "-1"))
+#: Cores used for ``cKDTree.query``. One: the engine runs single-threaded.
+#:
+#: This is a deliberate trade, not a free win. SciPy will fan a query across
+#: every core, and doing so is measurably faster — 24.7 s against 39.1 s on the
+#: reference part's ``quick`` profile, so serial costs about 1.6x. Results are
+#: identical either way; the fan-out was never a correctness question.
+#:
+#: It is off because a single-threaded engine is worth more than the 1.6x here.
+#: Under a profiler the fan-out charges its time to ``_thread.lock.acquire``
+#: rather than to the function that caused it, which put 88% of a profile
+#: somewhere unattributable and hid where the work actually was — every
+#: optimisation in this module was found only after turning it off. It also
+#: means one job now uses one core, so ``NEST_JOB_WORKERS`` scales cleanly
+#: instead of having each job fight the others for the same cores.
+#:
+#: Kept as a named constant rather than inlined so every query site still says
+#: out loud that it is serial, and so restoring the fan-out is a one-line
+#: change here rather than an edit to eleven call sites.
+KD_WORKERS = 1
 
 
 # --------------------------------------------------------------------------- #
