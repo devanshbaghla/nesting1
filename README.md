@@ -161,10 +161,32 @@ in `recommendations.json`.
 
 Repairs are checked rather than trusted. `fill_holes` will cap a large opening
 with a flat lid, giving a watertight mesh that is not the part, so a repaired
-solid must have positive volume and fit inside its own convex hull. A mesh that
-cannot be closed safely — a surface patch, a zero-thickness shell — is refused
-with an explanation instead of being nested. Pass `--no-repair` to the CLI to
-refuse open meshes outright.
+solid must have positive volume and fit inside its own convex hull. Pass
+`--no-repair` to the CLI to refuse open meshes outright.
+
+**What repair cannot mend gets rebuilt.** Some files are not nearly-solid and
+never will be: an assembly exported as two dozen open shells, a part whose
+seams were never knit. For those `MeshSolidify` rasterises the geometry into a
+voxel grid, flood-fills the interior and emits the filled/empty boundary — a
+surface that is closed and 2-manifold *by construction* rather than by repair.
+The trade is fidelity: it is quantised to the grid, so every dimension rounds
+outward by up to one voxel. That bound is reported (`solidify.error_mm`) and
+the job log says plainly that the nested geometry is a rasterisation of the
+input, because it is an approximation of the part rather than a repair of it.
+
+It is a last resort, reached only where the run would otherwise abort, and it
+refuses the same lies the repair path does: a flat sheet is not thickened into
+a slab, and an opening too wide to bridge leaves a hollow husk rather than a
+solid, which is detected and rejected. Pass `--no-solidify` to disable the
+fallback, or `--solidify-pitch` to choose the grid yourself.
+
+Standalone, without running a nesting job:
+
+```bash
+python solidify.py part.stl                  # -> part_solid.stl
+python solidify.py part.stl --check          # report only, exit 1 if open
+python solidify.py *.stl -d solids/          # batch
+```
 
 **`refiner=none` leaves gaps loose.** It keeps the conservative lattice pose —
 still valid, just further apart than requested (6–12 mm where you asked for 5).

@@ -103,7 +103,8 @@ class NestingRecommender:
         An open one is repaired here and nowhere else, so every stage below —
         audit, self-tests, both sweeps, refinement, export — sees one agreed
         geometry. Set ``repair=False`` in the config to refuse open meshes
-        instead of fixing them.
+        instead of fixing them, or ``solidify=False`` to keep the strict
+        topological repair without the voxel-rebuild fallback.
 
         :raises MeshRepairError: the mesh is open and cannot be closed safely.
         """
@@ -115,7 +116,12 @@ class NestingRecommender:
             mesh, self.denoise_report = MeshDenoise.strip_stray_shells(
                 mesh, ratio=self.cfg.denoise_ratio, log=self._log)
         mesh, self.repair_report = MeshRepair.ensure_solid(
-            mesh, allow_repair=self.cfg.repair, log=self._log)
+            mesh, allow_repair=self.cfg.repair,
+            allow_solidify=self.cfg.solidify,
+            solidify_pitch=self.cfg.solidify_pitch, log=self._log)
+        if self.repair_report.approximated:
+            self._log("    NOTE the nested geometry is a rasterisation of the "
+                      "input, so every dimension below carries that tolerance")
         return mesh
 
     # -- 2. audit + self-tests (gates) ------------------------------------- #
@@ -288,13 +294,20 @@ class NestingRecommender:
         asm.export(str(path))
         rec.stl = str(path)
 
-    def verify_one(self, path: str, full: bool) -> dict:
+    def verify_one(self, path: str, full: bool, n_faces: int | None = None) -> dict:
         """Re-measure the written STL from scratch.
 
         The file is re-read from disk rather than trusted, which is what makes
         this catch an export or transform bug. It uses the configured distance
         backend: on 'bvh' the sampled/exact split collapses, since one exact
         answer costs less than the cheap approximation did.
+
+        ``n_faces`` is the face count of one copy. A part that is a single
+        closed body splits into exactly two components and needs no hint, but
+        an assembly — or anything :class:`MeshSolidify` rasterised into several
+        shells — does not, and pairing components up by adjacency would be
+        guesswork. :meth:`export_one` writes copy A's faces and then copy B's,
+        so with the count the boundary between them is known exactly.
         """
         chk = trimesh.load(path)
         parts = chk.split(only_watertight=False)
@@ -302,15 +315,28 @@ class NestingRecommender:
                "watertight": [bool(p.is_watertight) for p in parts],
                "volumes": [float(p.volume) for p in parts],
                "extents": (chk.bounds[1] - chk.bounds[0]).tolist()}
-        if len(parts) == 2:
-            n = 250_000 if full else 60_000
-            backend = NesterFactory.backend(self.cfg)
-            d = backend(parts[0], parts[1], np.zeros(3),
-                        n_samples=n, move=0.0, seed=12345)
-            exact = full or backend is not SurfacePairDistance
-            out["gap"] = float(d.exact(np.zeros(3)) if exact
-                               else d.sampled(np.zeros(3)))
-            out["gap_method"] = "exact" if exact else "sampled"
+
+        if n_faces and len(chk.faces) == 2 * n_faces:
+            A = chk.submesh([np.arange(n_faces)], append=True)
+            B = chk.submesh([np.arange(n_faces, 2 * n_faces)], append=True)
+            out["copies_from"] = "face index"
+        elif len(parts) == 2:
+            A, B = parts
+            out["copies_from"] = "connectivity"
+        else:
+            out["copies_from"] = ""
+            out["gap_note"] = (f"{len(parts)} bodies and no face count; the two "
+                               f"copies could not be told apart to re-measure "
+                               f"the gap")
+            return out
+
+        n = 250_000 if full else 60_000
+        backend = NesterFactory.backend(self.cfg)
+        d = backend(A, B, np.zeros(3), n_samples=n, move=0.0, seed=12345)
+        exact = full or backend is not SurfacePairDistance
+        out["gap"] = float(d.exact(np.zeros(3)) if exact
+                           else d.sampled(np.zeros(3)))
+        out["gap_method"] = "exact" if exact else "sampled"
         return out
 
     # -- 7. pareto --------------------------------------------------------- #
@@ -441,7 +467,8 @@ class NestingRecommender:
         for i, r in enumerate(recs, 1):
             r.rank = i
             self.export_one(mesh, r, out_dir / f"{stl_path.stem}_nest_{i:02d}.stl")
-            r.verified = self.verify_one(r.stl, full=(i <= 3))
+            r.verified = self.verify_one(r.stl, full=(i <= 3),
+                                         n_faces=len(mesh.faces))
 
         self._log("[8/8] renders and report")
         Preview.part_views(mesh, str(out_dir / f"{stl_path.stem}_part_views.png"))
@@ -476,6 +503,8 @@ class NestingRecommender:
             "config": self.cfg.to_dict(),
             "denoise": self.denoise_report.to_dict() if self.denoise_report else None,
             "repair": self.repair_report.to_dict() if self.repair_report else None,
+            "approximated": bool(self.repair_report
+                                 and self.repair_report.approximated),
             "audit": audit,
             "self_tests": tests,
             "baselines": baselines,
@@ -532,6 +561,12 @@ def main(argv=None):
                    help="repair an open mesh before nesting (the default)")
     p.add_argument("--no-repair", dest="repair", action="store_false",
                    help="refuse an open mesh instead of repairing it")
+    p.add_argument("--no-solidify", dest="solidify", action="store_false",
+                   default=None,
+                   help="refuse a mesh that topological repair cannot close, "
+                        "instead of rebuilding it as a voxel solid")
+    p.add_argument("--solidify-pitch", type=float,
+                   help="voxel pitch for that rebuild (default: from part size)")
     p.add_argument("-q", "--quiet", action="store_true")
     p.add_argument("--describe", action="store_true",
                    help="print the algorithm registry and exit")
@@ -547,6 +582,7 @@ def main(argv=None):
             a.profile, clearance=a.clearance, objective=a.objective,
             refiner=a.refiner, coarse_pitch=a.coarse_pitch,
             fine_pitch=a.fine_pitch, n_samples=a.n_samples, repair=a.repair,
+            solidify=a.solidify, solidify_pitch=a.solidify_pitch,
             top_n=a.top, distance_backend=a.distance_backend,
             verbose=not a.quiet)
     except RuntimeError as exc:              # e.g. bvh selected without fcl

@@ -5,3 +5,13 @@ venv/
 data/jobs/
 *.egg-info/
 .DS_Store
+
+# run artefacts: nested STLs, previews, contact sheets, reports. `nest_out` is
+# the CLI default and every -o/--out-dir run adds another, tens of MB each.
+nest_out*/
+*_solid.stl
+
+# profiling output
+*.prof
+profile_report.txt
+profile_all_functions.csv

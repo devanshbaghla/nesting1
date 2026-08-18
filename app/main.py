@@ -121,6 +121,13 @@ async def create_job(
         # that was uploaded — say so where the user is already looking
         job.log.append(f"input mesh was not a closed solid; "
                        f"{stats['repair']['summary']}")
+    if stats.get("approximated"):
+        # a rasterised part is a different claim from a repaired one: every
+        # dimension below carries the grid tolerance, so it gets its own line
+        job.log.append(
+            f"the nested geometry is a rasterisation of the upload, accurate "
+            f"to +/-{stats['repair']['solidify']['error_mm']:.3f} (file "
+            f"units); dimensions and clearances inherit that tolerance")
     store.submit(job)
     return {"job_id": job.id, "status": job.status, "mesh": stats}
 

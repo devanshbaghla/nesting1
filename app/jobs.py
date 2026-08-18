@@ -226,6 +226,7 @@ def validate_upload(path: Path, repair: bool = True,
             "volume": round(float(mesh.volume), 1),
             "fill_ratio": round(float(mesh.volume / np.prod(mesh.extents)), 4),
             "repaired": bool(report.repaired),
+            "approximated": bool(report.approximated),
             "repair": report.to_dict(),
             "denoised": bool(noise.changed),
             "denoise": noise.to_dict()}

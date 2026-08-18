@@ -233,6 +233,12 @@ class NestingConfig:
     #: attempt automatic repair when the input mesh is not a closed solid.
     #: Watertight input never reaches the repair path, so this is inert for it.
     repair: bool = True
+    #: rebuild the part as a voxel solid when topological repair cannot close
+    #: it. Only reached where the run would otherwise abort, and the surface
+    #: it produces is an approximation — see MeshSolidify.
+    solidify: bool = True
+    #: voxel pitch for that rebuild; None picks one from the part's size
+    solidify_pitch: float | None = None
     #: drop disconnected debris before nesting. A single-body mesh never
     #: reaches the check, so this is inert for it.
     denoise: bool = True
