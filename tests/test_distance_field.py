@@ -14,7 +14,7 @@ import trimesh
 
 from app.core.nesting3d import (ClearanceGrid, Geometry, ScanlineVoxelizer,
                                 SurfaceDistanceField, SurfacePairDistance,
-                                SurfaceSampleCache)
+                                SurfaceSampleCache, TransformedDistanceField)
 
 PITCH = 0.5
 N = 40_000
@@ -240,6 +240,137 @@ def test_fields_are_keyed_by_pitch():
         pool.publish_field(mesh, 1.0, _field(mesh, pitch=1.0))
         assert pool.field_for(mesh, 1.0) is not None
         assert pool.field_for(mesh, 0.5) is None
+
+
+# --------------------------------------------------------------------------- #
+#  the transformed view
+# --------------------------------------------------------------------------- #
+def _rigid(angle=np.pi / 3, axis=(0.3, 1.0, 0.2), t=(4.0, -7.0, 130.0)):
+    M = trimesh.transformations.rotation_matrix(angle, axis)
+    M[:3, 3] = t
+    return M
+
+
+def test_a_view_bounds_the_moved_part():
+    """The whole point: one field, read through a rigid motion, still bounds."""
+    mesh = _part()
+    field = _field(mesh, margin=12.0)
+    M = _rigid()
+    moved = mesh.copy(); moved.apply_transform(M)
+    view = field.transformed(M)
+
+    rng = np.random.default_rng(7)
+    pts = rng.uniform(moved.bounds[0] - 4, moved.bounds[1] + 4, size=(1500, 3))
+    truth = _true_distance(moved, pts)
+    assert (view.lower_bound(pts) <= truth + 1e-9).all(), \
+        "the view's lower bound rose above the true distance"
+
+
+def test_a_view_is_no_looser_than_the_field_it_came_from():
+    """Moving the query must not cost accuracy beyond the declared tolerance."""
+    mesh = _part()
+    field = _field(mesh, margin=12.0)
+    M = _rigid()
+    moved = mesh.copy(); moved.apply_transform(M)
+    view = field.transformed(M)
+
+    rng = np.random.default_rng(11)
+    here = rng.uniform(mesh.bounds[0] - 4, mesh.bounds[1] + 4, size=(1200, 3))
+    there = trimesh.transform_points(here, M)
+    over_field = (field.values(here) - _true_distance(mesh, here)).max()
+    over_view = (view.values(there) - _true_distance(moved, there)).max()
+    assert over_field <= field.tolerance, over_field
+    assert over_view <= view.tolerance, over_view
+
+
+def test_identity_view_matches_the_field():
+    field = _field(_part())
+    view = field.transformed(np.eye(4))
+    rng = np.random.default_rng(3)
+    pts = rng.uniform(-30, 60, size=(500, 3))
+    assert np.allclose(field.values(pts), view.values(pts), atol=1e-9)
+
+
+def test_a_view_shares_the_array_rather_than_copying_it():
+    field = _field(_part())
+    view = field.transformed(_rigid())
+    assert view.field is field
+    assert view.nbytes == 0
+
+
+def test_a_non_rigid_transform_is_refused():
+    """A scale would stretch distance and silently invalidate every bound."""
+    field = _field(_part())
+    for bad in (np.diag([2.0, 1.0, 1.0, 1.0]),          # scale
+                np.array([[1, 0.4, 0, 0], [0, 1, 0, 0],  # shear
+                          [0, 0, 1, 0], [0, 0, 0, 1]], float)):
+        try:
+            field.transformed(bad)
+        except ValueError as exc:
+            assert "rigid" in str(exc)
+        else:
+            raise AssertionError("a non-rigid transform must be refused")
+
+
+def test_a_malformed_transform_is_refused():
+    field = _field(_part())
+    try:
+        field.transformed(np.eye(3))
+    except ValueError as exc:
+        assert "4x4" in str(exc)
+    else:
+        raise AssertionError("a 3x3 matrix must be refused")
+
+
+# --------------------------------------------------------------------------- #
+#  both-sided pruning
+# --------------------------------------------------------------------------- #
+def test_mask_within_matches_a_full_query():
+    mesh, mB, t0 = _pair()
+    field = _field(mesh)
+    with SurfaceSampleCache():
+        d = SurfacePairDistance(mesh, mB, t0, n_samples=N, field=field)
+    pts = d.pB + t0
+    for band in (1.0, 4.0, 13.0):
+        want = d.treeA.query(pts)[0] <= band
+        assert np.array_equal(d.mask_within(d.treeA, pts, band, field), want), band
+        assert np.array_equal(d.mask_within(d.treeA, pts, band, None), want), band
+
+
+def test_both_sided_pruning_leaves_every_number_alone():
+    """field_b prunes the A-side; qA, qB and the gap must not move."""
+    mesh = _part()
+    M = trimesh.transformations.rotation_matrix(np.pi, [1, 0, 0])
+    M[:3, 3] = [0.0, 0.0, float(mesh.extents[2]) + 6.0]
+    mB = mesh.copy(); mB.apply_transform(M)
+    fa = _field(mesh)
+    fb = fa.transformed(M)
+
+    with SurfaceSampleCache():
+        plain = SurfacePairDistance(mesh, mB, np.zeros(3), n_samples=N, move=0.0)
+        a_only = SurfacePairDistance(mesh, mB, np.zeros(3), n_samples=N,
+                                     move=0.0, field=fa)
+        both = SurfacePairDistance(mesh, mB, np.zeros(3), n_samples=N,
+                                   move=0.0, field=fa, field_b=fb)
+    for other, tag in ((a_only, "A only"), (both, "A and B")):
+        assert np.array_equal(plain.qA, other.qA), tag
+        assert np.array_equal(plain.qB, other.qB), tag
+        assert np.array_equal(plain.subB, other.subB), tag
+        assert plain.exact(np.zeros(3)) == other.exact(np.zeros(3)), tag
+
+
+def test_field_b_alone_is_allowed():
+    """Either side may be omitted; only that side loses its pruning."""
+    mesh = _part()
+    M = trimesh.transformations.rotation_matrix(np.pi, [1, 0, 0])
+    M[:3, 3] = [0.0, 0.0, float(mesh.extents[2]) + 6.0]
+    mB = mesh.copy(); mB.apply_transform(M)
+    with SurfaceSampleCache():
+        plain = SurfacePairDistance(mesh, mB, np.zeros(3), n_samples=N, move=0.0)
+        b_only = SurfacePairDistance(mesh, mB, np.zeros(3), n_samples=N,
+                                     move=0.0, field_b=_field(mesh).transformed(M))
+    assert np.array_equal(plain.qA, b_only.qA)
+    assert plain.exact(np.zeros(3)) == b_only.exact(np.zeros(3))
 
 
 if __name__ == "__main__":

@@ -82,7 +82,8 @@ except ImportError:                     # pragma: no cover - absence is normal
 
 __all__ = [
     "MeshAudit", "ScanlineVoxelizer", "ClearanceGrid", "TranslationOracle",
-    "OrientationSet", "SurfaceDistanceField", "SurfacePairDistance",
+    "OrientationSet", "SurfaceDistanceField", "TransformedDistanceField",
+    "SurfacePairDistance",
     "BVHPairDistance",
     "SurfaceSampleCache", "Refiner", "Geometry", "Validation", "Preview",
     "PairNester", "NestResult", "MeshRepair", "MeshRepairError",
@@ -392,6 +393,16 @@ class SurfaceDistanceField:
         mask = None if radius is None else (dt <= radius)
         return cls(dt, np.asarray(i0) - pad, pitch), mask
 
+    def transformed(self, matrix: np.ndarray) -> "TransformedDistanceField":
+        """A view of this field describing the part moved by ``matrix``.
+
+        A rigid motion preserves distance, so the field of a moved copy is the
+        original field read at the pre-image of the query point. That makes one
+        transform enough to serve every placement of the same part — the array
+        is shared, not copied, so a view costs nothing but the 4x4.
+        """
+        return TransformedDistanceField(self, matrix)
+
     def values(self, points: np.ndarray) -> np.ndarray:
         """Interpolated surface distance at each point, in file units."""
         idx = (np.asarray(points, float) / self.pitch - 0.5) - self.origin[None, :]
@@ -399,6 +410,46 @@ class SurfaceDistanceField:
 
     def lower_bound(self, points: np.ndarray) -> np.ndarray:
         """Values floored by the lattice tolerance; never above the truth."""
+        return np.maximum(self.values(points) - self.tolerance, 0.0)
+
+
+class TransformedDistanceField:
+    """One part's distance field, read as though the part had been moved.
+
+    Nesting places the same part twice, and verification re-reads both copies
+    from disk. Rasterising each placement separately would mean a distance
+    transform per copy per recommendation; a rigid motion preserves distance,
+    so mapping the query back through the inverse gives the same answer from
+    the array that already exists.
+
+    Only rigid motions are admissible. A scale or a shear would stretch
+    distance and quietly break the bound every caller relies on, so the matrix
+    is checked once at construction rather than trusted.
+    """
+
+    def __init__(self, field: SurfaceDistanceField, matrix: np.ndarray):
+        matrix = np.asarray(matrix, float)
+        if matrix.shape != (4, 4):
+            raise ValueError(f"expected a 4x4 transform, got {matrix.shape}")
+        R = matrix[:3, :3]
+        if not np.allclose(R @ R.T, np.eye(3), atol=1e-8):
+            raise ValueError("transform is not rigid; distance would not be "
+                             "preserved and the bound would be invalid")
+        self.field = field
+        self.matrix = matrix
+        self.inverse = np.linalg.inv(matrix)
+        self.pitch = field.pitch
+        self.tolerance = field.tolerance
+
+    @property
+    def nbytes(self) -> int:
+        return 0                      # a view; the array belongs to the field
+
+    def values(self, points: np.ndarray) -> np.ndarray:
+        return self.field.values(
+            trimesh.transform_points(np.asarray(points, float), self.inverse))
+
+    def lower_bound(self, points: np.ndarray) -> np.ndarray:
         return np.maximum(self.values(points) - self.tolerance, 0.0)
 
 
@@ -730,15 +781,17 @@ class SurfacePairDistance:
     magnitude <= ``move``, since its distance drops by at most ``move`` while
     the running minimum rises by at most ``move``.
 
-    A :class:`SurfaceDistanceField` for part A, when one is supplied, is used
-    to shrink the KD queries against A's tree — never to answer them. See
-    :meth:`min_distance_to`. Every number this class returns is identical with
-    and without it; only the number of tree descents changes.
+    A :class:`SurfaceDistanceField` for part A (``field``) and one for part B
+    (``field_b``), when supplied, are used to shrink the KD queries against the
+    corresponding tree — never to answer them. See :meth:`min_distance_to` and
+    :meth:`mask_within`. Every number this class returns is identical with and
+    without them; only the number of tree descents changes. Either may be
+    omitted, and omitting one costs nothing but the pruning on that side.
     """
 
     def __init__(self, meshA, meshB, t_ref, n_samples: int = 220_000,
-                 move: float = 6.0, seed: int = 0, field=None):
-        self.field = field
+                 move: float = 6.0, seed: int = 0, field=None, field_b=None):
+        self.field, self.field_b = field, field_b
         rng = np.random.default_rng(seed)
         pool = SurfaceSampleCache.current()
         if pool is None:
@@ -756,13 +809,13 @@ class SurfacePairDistance:
                            np.sqrt(meshB.area / n_samples))
 
         t_ref = np.asarray(t_ref, float)
-        # B against A's tree can use A's field to skip most of the work; A
-        # against B's tree cannot, because the field describes A, and B's is a
-        # different rotation on every candidate — not worth building for one use
+        # Both prunes share one band, taken from B's side. A's side is a plain
+        # threshold against that band, so it needs `field_b` — a field for the
+        # geometry `treeB` was built from — and gets one only where the caller
+        # can supply it without paying for a second distance transform.
         keepB, band = self._band_mask(self.treeA, self.pB + t_ref, move,
                                       self.field)
-        dA, _ = self.treeB.query(self.pA - t_ref, workers=KD_WORKERS)
-        keepA = dA <= band
+        keepA = self.mask_within(self.treeB, self.pA - t_ref, band, self.field_b)
         self.qB, self.qfB = self.pB[keepB], self.fB[keepB]
         self.qA, self.qfA = self.pA[keepA], self.fA[keepA]
         self.subB = self.qB[::4]                # cheap metric for inner loops
@@ -820,12 +873,27 @@ class SurfacePairDistance:
             return d <= band, band
 
         band = self.min_distance_to(tree, points, field) + 2.0 * move + 1.0
+        return self.mask_within(tree, points, band, field), band
+
+    def mask_within(self, tree, points, band: float, field):
+        """``tree.query(points) <= band``, computing distances only where it can hold.
+
+        A point whose lower bound already exceeds the band cannot have a true
+        distance inside it, so it is False without being queried. The mask
+        equals the one a full query produces; only the count of descents falls,
+        and it falls furthest when the band is tight — the constructor's
+        ``move=0`` case narrows it to a millimetre.
+        """
+        points = np.asarray(points, float)
+        if field is None:
+            d, _ = tree.query(points, workers=KD_WORKERS)
+            return d <= band
         candidate = field.lower_bound(points) <= band
         mask = np.zeros(len(points), bool)
         if candidate.any():
             d, _ = tree.query(points[candidate], workers=KD_WORKERS)
             mask[candidate] = d <= band
-        return mask, band
+        return mask
 
     # -- metrics ----------------------------------------------------------- #
     def sampled(self, t, coarse: bool = False) -> float:

@@ -294,7 +294,8 @@ class NestingRecommender:
         asm.export(str(path))
         rec.stl = str(path)
 
-    def verify_one(self, path: str, full: bool, n_faces: int | None = None) -> dict:
+    def verify_one(self, path: str, full: bool, n_faces: int | None = None,
+                   mesh=None, transform=None) -> dict:
         """Re-measure the written STL from scratch.
 
         The file is re-read from disk rather than trusted, which is what makes
@@ -308,6 +309,15 @@ class NestingRecommender:
         shells — does not, and pairing components up by adjacency would be
         guesswork. :meth:`export_one` writes copy A's faces and then copy B's,
         so with the count the boundary between them is known exactly.
+
+        ``mesh`` and ``transform`` are an optimisation, and an optional one.
+        Both copies on disk are rigid placements of the same part, so the
+        distance field built during the sweep describes them too once it is
+        moved into place — which removes the two full cross-queries this method
+        would otherwise spend on pruning. The placement is *checked against the
+        file*, never assumed: see :meth:`_verify_fields`. A file that does not
+        match is exactly the export bug this stage exists to catch, so the
+        mismatch is recorded and the unpruned path runs instead.
         """
         chk = trimesh.load(path)
         parts = chk.split(only_watertight=False)
@@ -332,12 +342,63 @@ class NestingRecommender:
 
         n = 250_000 if full else 60_000
         backend = NesterFactory.backend(self.cfg)
-        d = backend(A, B, np.zeros(3), n_samples=n, move=0.0, seed=12345)
+        kw = {}
+        if backend is SurfacePairDistance:
+            fa, fb, note = self._verify_fields(A, B, mesh, transform)
+            kw = {"field": fa, "field_b": fb}
+            out["pruned_by_field"] = bool(fa is not None or fb is not None)
+            if note:
+                out["field_note"] = note
+        d = backend(A, B, np.zeros(3), n_samples=n, move=0.0, seed=12345, **kw)
         exact = full or backend is not SurfacePairDistance
         out["gap"] = float(d.exact(np.zeros(3)) if exact
                            else d.sampled(np.zeros(3)))
         out["gap_method"] = "exact" if exact else "sampled"
         return out
+
+    def _verify_fields(self, A, B, mesh, transform):
+        """Distance fields for the two written copies, or ``(None, None, why)``.
+
+        The sweep's field describes the part at the origin. Copy A on disk is
+        that part translated, copy B is it rotated and translated, so both are
+        views of the one array — provided the file really does contain those
+        placements.
+
+        That is checked, not assumed, and it has to be: a field placed where
+        the geometry is not would under-state nothing and over-state some
+        distances, pruning away the very points that hold the true minimum, and
+        the gap would come back too large. Since a wrong export is precisely
+        what this method is here to detect, the check compares the expected
+        triangle centroids against the ones read from the file and declines the
+        optimisation on any disagreement.
+        """
+        if mesh is None or transform is None:
+            return None, None, ""
+        pool = SurfaceSampleCache.current()
+        field = pool.field_for(mesh, self.cfg.fine_pitch) if pool else None
+        if field is None:
+            return None, None, "no field was built during the sweep"
+
+        M = np.asarray(transform, float)
+        # export_one writes _assembly's output, which corner-aligns the pair
+        shift = np.zeros(3)
+        if self.cfg.origin_corner:
+            mB = mesh.copy(); mB.apply_transform(M)
+            shift = -np.minimum(mesh.bounds[0], mB.bounds[0])
+        place_a = trimesh.transformations.translation_matrix(shift)
+        place_b = place_a @ M
+
+        tol = 1e-4 * max(1.0, float(np.max(mesh.extents)))
+        for placed, got, which in ((place_a, A, "A"), (place_b, B, "B")):
+            if len(got.faces) != len(mesh.faces):
+                return None, None, (f"copy {which} has {len(got.faces):,} faces, "
+                                    f"the part has {len(mesh.faces):,}")
+            want = trimesh.transform_points(mesh.triangles.mean(axis=1), placed)
+            err = float(np.abs(want - got.triangles.mean(axis=1)).max())
+            if err > tol:
+                return None, None, (f"copy {which} on disk is {err:.4g} from its "
+                                    f"expected placement; not reusing the field")
+        return field.transformed(place_a), field.transformed(place_b), ""
 
     # -- 7. pareto --------------------------------------------------------- #
     @staticmethod
@@ -468,7 +529,8 @@ class NestingRecommender:
             r.rank = i
             self.export_one(mesh, r, out_dir / f"{stl_path.stem}_nest_{i:02d}.stl")
             r.verified = self.verify_one(r.stl, full=(i <= 3),
-                                         n_faces=len(mesh.faces))
+                                         n_faces=len(mesh.faces),
+                                         mesh=mesh, transform=r.transform)
 
         self._log("[8/8] renders and report")
         Preview.part_views(mesh, str(out_dir / f"{stl_path.stem}_part_views.png"))
