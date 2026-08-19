@@ -1,6 +1,9 @@
+import {PartViewer} from './viewer.js';
+
 const $ = (s) => document.querySelector(s);
 const fmt = (n) => n.toLocaleString(undefined, {maximumFractionDigits: 0});
-let jobId = null, poller = null;
+const dim = (n) => n.toLocaleString(undefined, {maximumFractionDigits: 2});
+let jobId = null, poller = null, viewer = null;
 
 /* ---------- upload ---------- */
 const dz = $('#dropzone'), fileInput = $('#file');
@@ -21,23 +24,140 @@ function showName() {
   $('#filehint').textContent = f ? `${f.name} — ${(f.size/1e6).toFixed(1)} MB` : 'Open meshes are repaired automatically. Up to 300 MB.';
 }
 
+/* Upload goes to the preview, not to the queue: nothing is denoised or nested
+   until the part has been looked at. */
 $('#upload-form').onsubmit = async (e) => {
   e.preventDefault();
   if (!fileInput.files.length) { alert('Choose an STL first.'); return; }
   const fd = new FormData(e.target);
   fd.set('file', fileInput.files[0]);
   $('#submit').disabled = true;
+  $('#submit').textContent = 'Reading…';
   hide('#error-panel'); hide('#results');
   try {
-    const r = await fetch('/api/jobs', {method: 'POST', body: fd});
+    const r = await fetch('/api/preview', {method: 'POST', body: fd});
     const data = await r.json();
     if (!r.ok) throw new Error(data.detail || 'upload rejected');
     jobId = data.job_id;
-    hide('#upload-panel'); show('#progress-panel');
+    hide('#upload-panel');
+    show('#preview-panel');
+    renderPreview(data.preview);
+    await loadGeometry();
+  } catch (err) {
+    fail(err.message);
+  } finally {
+    $('#submit').disabled = false;
+    $('#submit').textContent = 'Preview part';
+  }
+};
+
+/* ---------- preview ---------- */
+function renderPreview(p) {
+  $('#preview-summary').textContent = p.summary;
+  $('#preview-summary').className = 'summary' + (p.has_noise ? ' warn' : ' ok');
+
+  const e = p.extents, o = p.object_extents;
+  $('#preview-facts').innerHTML = [
+    ['File', p.filename],
+    ['Triangles', fmt(p.faces)],
+    ['Bodies', p.bodies],
+    ['Overall L × W × H', `${dim(e[0])} × ${dim(e[1])} × ${dim(e[2])}`],
+    ['Object L × W × H', `${dim(o[0])} × ${dim(o[1])} × ${dim(o[2])}`],
+    ['Watertight', p.watertight ? 'yes' : 'no'],
+  ].map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join('');
+
+  $('#preview-rule').innerHTML =
+    `A body is <b>noise</b> only when it is <b>both</b> detached from the object
+     — standing more than <b>${dim(p.touch_tolerance)}</b> clear of it — and
+     under <b>${dim(p.threshold)}</b> across, which is
+     <b>${(p.ratio * 100).toFixed(0)}%</b> of the object's smallest dimension
+     (${dim(p.object_smallest)}). Anything touching the object is kept whatever
+     its size.`;
+
+  const frags = p.bodies > 1 ? p.fragments : [];
+  $('#frag-list').innerHTML = frags.length ? frags
+    .slice()
+    .sort((a, b) => (b.is_noise - a.is_noise) || (b.largest - a.largest))
+    .map(f => `
+      <div class="frag ${f.is_noise ? 'is-noise' : ''}" title="${f.reason}">
+        <span class="dot"></span>
+        <span class="frag-id">body ${f.index}</span>
+        <span class="frag-size">${dim(f.extents[0])} × ${dim(f.extents[1])} × ${dim(f.extents[2])}</span>
+        <span class="frag-max">${f.gap === null ? '' : 'gap ' + dim(f.gap)}</span>
+        <span class="frag-tag">${f.is_noise ? 'NOISE' : 'keep'}</span>
+      </div>`).join('') : '';
+
+  const btn = $('#denoise');
+  btn.disabled = !p.has_noise;
+  btn.textContent = p.has_noise
+    ? `Remove ${p.noise_bodies} noise ${p.noise_bodies === 1 ? 'body' : 'bodies'}`
+    : 'No noise to remove';
+  btn.title = p.has_noise
+    ? `${fmt(p.noise_faces)} triangles will be deleted from the file to be nested`
+    : '';
+  $('#toggle-noise').disabled = !p.has_noise;
+  $('#denoise-note').textContent = p.decimated_to
+    ? `Preview decimated to ${fmt(p.decimated_to)} triangles for drawing; nesting uses the full mesh.`
+    : '';
+}
+
+async function loadGeometry() {
+  const el = $('#viewer-loading');
+  el.classList.remove('hidden');
+  try {
+    const r = await fetch(`/api/preview/${jobId}/geometry`);
+    const payload = await r.json();
+    if (!r.ok) throw new Error(payload.detail || 'could not read geometry');
+    if (!viewer) viewer = new PartViewer($('#preview-canvas'));
+    viewer.load(payload);
+    viewer.setNoiseVisible($('#toggle-noise').checked);
+    viewer.setPartOpacity($('#toggle-ghost').checked ? 0.25 : 1);
+    if (payload.decimated_to) {
+      $('#denoise-note').textContent =
+        `Preview decimated to ${fmt(payload.decimated_to)} triangles for drawing; nesting uses the full mesh.`;
+    }
+  } catch (err) {
+    el.textContent = err.message;
+    return;
+  }
+  el.classList.add('hidden');
+}
+
+$('#view-reset').onclick = () => viewer && viewer.resetView();
+$('#toggle-noise').onchange = (e) => viewer && viewer.setNoiseVisible(e.target.checked);
+$('#toggle-ghost').onchange = (e) => viewer && viewer.setPartOpacity(e.target.checked ? 0.25 : 1);
+$('#preview-cancel').onclick = () => location.reload();
+
+$('#denoise').onclick = async () => {
+  const btn = $('#denoise');
+  btn.disabled = true; btn.textContent = 'Removing…';
+  try {
+    const r = await fetch(`/api/preview/${jobId}/denoise`, {method: 'POST'});
+    const data = await r.json();
+    if (!r.ok) throw new Error(data.detail || 'denoise failed');
+    renderPreview(data.preview);
+    await loadGeometry();
+    $('#denoise-note').textContent =
+      `Removed ${data.removed} ${data.removed === 1 ? 'fragment' : 'fragments'} (${fmt(data.removed_faces || 0)} triangles). The file to be nested has been updated.`;
+  } catch (err) {
+    $('#denoise-note').textContent = err.message;
+    btn.disabled = false;
+  }
+};
+
+$('#nest-now').onclick = async () => {
+  const btn = $('#nest-now');
+  btn.disabled = true; btn.textContent = 'Starting…';
+  try {
+    const r = await fetch(`/api/preview/${jobId}/nest`, {method: 'POST'});
+    const data = await r.json();
+    if (!r.ok) throw new Error(data.detail || 'could not start the run');
+    hide('#preview-panel'); show('#progress-panel');
     poller = setInterval(poll, 1200); poll();
   } catch (err) {
     fail(err.message);
-  } finally { $('#submit').disabled = false; }
+    hide('#preview-panel');
+  } finally { btn.disabled = false; btn.textContent = 'Nest it'; }
 };
 
 /* ---------- polling ---------- */

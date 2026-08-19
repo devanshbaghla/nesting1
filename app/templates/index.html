@@ -55,8 +55,44 @@
         <strong>quick</strong> ~1–3 min · <strong>standard</strong> ~10 min · <strong>full</strong> adds a 744-orientation sweep.
         Refinement <strong>none</strong> is fastest but leaves gaps looser than requested; <strong>profile</strong> squeezes closest.
       </p>
-      <button type="submit" id="submit">Nest it</button>
+      <button type="submit" id="submit">Preview part</button>
     </form>
+  </section>
+
+  <section class="panel hidden" id="preview-panel">
+    <div class="results-head">
+      <h2>Check the part before nesting</h2>
+      <button type="button" id="preview-cancel" class="btn ghost">Choose another file</button>
+    </div>
+
+    <div class="preview-wrap">
+      <div class="viewer">
+        <canvas id="preview-canvas"></canvas>
+        <div class="viewer-hint">drag to orbit · scroll to zoom · right-drag to pan</div>
+        <div class="viewer-tools">
+          <button type="button" class="chip" id="view-reset">Reset view</button>
+          <label class="chip"><input type="checkbox" id="toggle-noise" checked> Show noise</label>
+          <label class="chip"><input type="checkbox" id="toggle-ghost"> Ghost part</label>
+        </div>
+        <p class="viewer-loading" id="viewer-loading">loading geometry…</p>
+      </div>
+
+      <aside class="preview-side">
+        <p id="preview-summary" class="summary"></p>
+        <dl class="facts" id="preview-facts"></dl>
+        <p class="legend">
+          <span class="swatch part"></span> part
+          <span class="swatch noise"></span> noise
+        </p>
+        <p class="rule" id="preview-rule"></p>
+        <div class="frag-list" id="frag-list"></div>
+        <div class="preview-actions">
+          <button type="button" id="denoise" class="btn danger">Remove noise</button>
+          <button type="button" id="nest-now" class="btn">Nest it</button>
+        </div>
+        <p class="note" id="denoise-note"></p>
+      </aside>
+    </div>
   </section>
 
   <section class="panel hidden" id="progress-panel">
@@ -101,6 +137,9 @@
 </div>
 
 <footer><p>Engine: exact scanline voxelisation → FFT translation search → continuous refinement against exact point-to-triangle distance. <a href="/docs">API docs</a> · <a href="/api/algorithms">algorithms</a></p></footer>
-<script src="/static/app.js"></script>
+<script type="importmap">
+{"imports": {"three": "/static/vendor/three.module.js"}}
+</script>
+<script type="module" src="/static/app.js"></script>
 </body>
 </html>

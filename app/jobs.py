@@ -40,7 +40,7 @@ class Job:
     id: str
     filename: str
     params: dict
-    status: str = "queued"           # queued | running | done | failed
+    status: str = "queued"           # preview | queued | running | done | failed
     stage: str = "queued"
     progress: float = 0.0
     created: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
@@ -86,9 +86,12 @@ class JobStore:
     def purge_expired(self):
         cutoff = datetime.now(timezone.utc) - timedelta(hours=config.JOB_TTL_HOURS)
         with self._lock:
+            # "preview" is included because a job can be abandoned there: the
+            # file is uploaded and inspected but never nested, and nothing
+            # else would ever collect it
             stale = [j for j in self._jobs.values()
                      if datetime.fromisoformat(j.created) < cutoff
-                     and j.status in ("done", "failed")]
+                     and j.status in ("done", "failed", "preview")]
             for j in stale:
                 shutil.rmtree(j.dir, ignore_errors=True)
                 self._jobs.pop(j.id, None)

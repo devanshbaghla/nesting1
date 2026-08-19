@@ -7,6 +7,10 @@ with isometric previews and downloadable orthographic views.
 Routes
 ------
 GET  /                                       upload page + results UI
+POST /api/preview                            upload an STL, inspect it, nest nothing
+GET  /api/preview/{id}/geometry              triangles, split into part and noise
+POST /api/preview/{id}/denoise               drop the noise fragments
+POST /api/preview/{id}/nest                  accept the part and queue the run
 POST /api/jobs                               upload an STL, returns a job id
 GET  /api/jobs                               list jobs
 GET  /api/jobs/{id}                          status, progress, recommendations
@@ -34,7 +38,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from starlette.requests import Request
 
-from . import config
+from . import config, preview
 from .core.nesting3d import HAVE_FCL
 from .core.nesting_factory import PROFILES, AlgorithmRegistry
 from .jobs import store, validate_upload
@@ -79,6 +83,30 @@ async def create_job(
     refiner: str = Form("descend"),
     distance_backend: str = Form(config.DEFAULT_DISTANCE_BACKEND),
 ):
+    params = _validated_params(file, clearance, top_n, profile, objective,
+                               refiner, distance_backend)
+    name = Path(file.filename or "part.stl").name
+    job = store.create(name, params)
+    dest = job.dir / name
+    with dest.open("wb") as fh:
+        shutil.copyfileobj(file.file, fh)
+
+    try:
+        stats = validate_upload(dest)
+    except ValueError as exc:
+        shutil.rmtree(job.dir, ignore_errors=True)
+        raise HTTPException(422, str(exc)) from exc
+
+    job.audit = stats
+    _note_intake(job, stats)
+    store.submit(job)
+    return {"job_id": job.id, "status": job.status, "mesh": stats}
+
+
+def _validated_params(file: UploadFile, clearance: float, top_n: int,
+                      profile: str, objective: str, refiner: str,
+                      distance_backend: str) -> dict:
+    """Reject a bad request before a byte is written to disk."""
     name = Path(file.filename or "part.stl").name
     if not name.lower().endswith(".stl"):
         raise HTTPException(400, "please upload a .stl file")
@@ -97,22 +125,13 @@ async def create_job(
         raise HTTPException(400, "top_n must be between 1 and 20")
     if clearance < 0:
         raise HTTPException(400, "clearance must be positive")
+    return {"clearance": clearance, "top_n": top_n, "profile": profile,
+            "objective": objective, "refiner": refiner,
+            "distance_backend": distance_backend}
 
-    params = {"clearance": clearance, "top_n": top_n, "profile": profile,
-              "objective": objective, "refiner": refiner,
-              "distance_backend": distance_backend}
-    job = store.create(name, params)
-    dest = job.dir / name
-    with dest.open("wb") as fh:
-        shutil.copyfileobj(file.file, fh)
 
-    try:
-        stats = validate_upload(dest)
-    except ValueError as exc:
-        shutil.rmtree(job.dir, ignore_errors=True)
-        raise HTTPException(422, str(exc)) from exc
-
-    job.audit = stats
+def _note_intake(job, stats: dict) -> None:
+    """Put anything intake changed about the mesh into the job's own log."""
     if stats.get("denoised"):
         job.log.append(f"input mesh carried loose fragments; "
                        f"{stats['denoise']['summary']}")
@@ -128,8 +147,108 @@ async def create_job(
             f"the nested geometry is a rasterisation of the upload, accurate "
             f"to +/-{stats['repair']['solidify']['error_mm']:.3f} (file "
             f"units); dimensions and clearances inherit that tolerance")
+
+
+# --------------------------------------------------------------------------- #
+#  Preview: look at the part, and its debris, before committing to a run
+# --------------------------------------------------------------------------- #
+@app.post("/api/preview")
+async def create_preview(
+    file: UploadFile = File(...),
+    clearance: float = Form(config.DEFAULT_CLEARANCE),
+    top_n: int = Form(config.DEFAULT_TOP_N),
+    profile: str = Form(config.DEFAULT_PROFILE),
+    objective: str = Form("volume"),
+    refiner: str = Form("descend"),
+    distance_backend: str = Form(config.DEFAULT_DISTANCE_BACKEND),
+):
+    """Upload and inspect, without starting anything.
+
+    The job directory and TTL machinery are reused, so the file is stored once
+    and the eventual run reads the same bytes the preview drew — including any
+    denoising the user agreed to.
+    """
+    params = _validated_params(file, clearance, top_n, profile, objective,
+                               refiner, distance_backend)
+    name = Path(file.filename or "part.stl").name
+    job = store.create(name, params)
+    job.status = job.stage = "preview"
+    dest = job.dir / name
+    with dest.open("wb") as fh:
+        shutil.copyfileobj(file.file, fh)
+
+    try:
+        mesh = preview.load_mesh(dest)
+    except Exception as exc:
+        shutil.rmtree(job.dir, ignore_errors=True)
+        store._jobs.pop(job.id, None)
+        raise HTTPException(422, f"could not parse as STL: {exc}") from exc
+    if not hasattr(mesh, "faces") or len(mesh.faces) == 0:
+        shutil.rmtree(job.dir, ignore_errors=True)
+        store._jobs.pop(job.id, None)
+        raise HTTPException(422, "no triangles found in the file")
+
+    _, report = preview.classify(mesh, filename=name)
+    job.audit = {"preview": report.to_dict()}
+    return {"job_id": job.id, "preview": report.to_dict()}
+
+
+@app.get("/api/preview/{job_id}/geometry")
+def preview_geometry(job_id: str):
+    """Triangles for the viewer, split into the part and each noise fragment."""
+    job = _job(job_id)
+    mesh = preview.load_mesh(_source_stl(job))
+    comps, report = preview.classify(mesh, filename=job.filename)
+    return JSONResponse(preview.geometry_payload(mesh, comps, report))
+
+
+@app.post("/api/preview/{job_id}/denoise")
+def preview_denoise(job_id: str):
+    """Drop the fragments the rule called noise, and rewrite the upload.
+
+    Destructive by intent — this is the button that says yes. The file the run
+    will read is replaced, so what was drawn is what gets nested.
+    """
+    job = _job(job_id)
+    path = _source_stl(job)
+    mesh = preview.load_mesh(path)
+    cleaned, report = preview.drop_noise(mesh)
+    if not report.has_noise:
+        return {"job_id": job.id, "removed": 0,
+                "preview": report.to_dict(), "note": "nothing matched the rule"}
+
+    cleaned.export(str(path))
+    _, after = preview.classify(preview.load_mesh(path), filename=job.filename)
+    job.audit = {"preview": after.to_dict(), "denoised_from": report.to_dict()}
+    job.log.append(f"removed {report.noise_bodies} noise "
+                   f"{'fragment' if report.noise_bodies == 1 else 'fragments'} "
+                   f"({report.noise_faces:,} triangles) before nesting")
+    return {"job_id": job.id, "removed": report.noise_bodies,
+            "removed_faces": report.noise_faces, "preview": after.to_dict()}
+
+
+@app.post("/api/preview/{job_id}/nest")
+def preview_nest(job_id: str):
+    """Accept the part as previewed and queue the run."""
+    job = _job(job_id)
+    if job.status != "preview":
+        raise HTTPException(409, f"job is already {job.status}")
+    try:
+        stats = validate_upload(_source_stl(job))
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    job.audit = {**job.audit, **stats}
+    _note_intake(job, stats)
+    job.status, job.stage = "queued", "queued"
     store.submit(job)
     return {"job_id": job.id, "status": job.status, "mesh": stats}
+
+
+def _source_stl(job) -> Path:
+    path = job.dir / job.filename
+    if not path.exists():
+        raise HTTPException(404, "the uploaded file is no longer on disk")
+    return path
 
 
 @app.get("/api/jobs")
