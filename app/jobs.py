@@ -28,11 +28,10 @@ from .core.mesh_repair import (DenoiseReport, MeshDenoise, MeshRepair,
                                MeshRepairError)
 from .core.nest_base import NestingRecommender
 from .core.nesting_factory import NesterFactory
-from .renders import render
 
 # stage headings emitted by the engine, used to turn its log into a progress bar
 _STAGES = ["load", "audit", "self-tests", "coarse sweep", "fine sweep",
-           "diversify", "refine + export", "renders"]
+           "diversify", "refine + export", "report"]
 
 
 @dataclass
@@ -117,13 +116,14 @@ class JobStore:
             results = rec.recommend(job.dir / job.filename, job.dir,
                                     job.params["top_n"])
 
-            job.stage = "rendering isometric views"
-            job.progress = 0.92
+            # No render pass: export_one already wrote each pair as a GLB
+            # while its two copies were still in memory, so there is nothing
+            # left to draw. This stage used to rasterise one isometric PNG per
+            # recommendation and was the most expensive thing after refinement.
+            job.stage = "collecting results"
+            job.progress = 0.97
             payload = []
             for r in results:
-                iso = job.dir / f"rec_{r.rank:02d}_iso.png"
-                render(r.stl, "iso", iso, dpi=config.RENDER_DPI, figsize=4.6,
-                       label=f"#{r.rank}  {r.volume:,.0f} mm³")
                 payload.append({
                     "rank": r.rank, "label": r.label, "source": r.source,
                     "extents": [round(v, 2) for v in r.extents],
@@ -134,7 +134,7 @@ class JobStore:
                     "refined": r.refined, "pareto": r.pareto,
                     "transform": r.transform,
                     "stl": Path(r.stl).name,
-                    "iso": iso.name,
+                    "glb": Path(r.glb).name if r.glb else "",
                     "verified": r.verified,
                 })
             job.recommendations = payload

@@ -41,7 +41,6 @@ tr.is-pareto td:first-child{border-left:3px solid var(--accent)}
 .cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:16px}
 .card{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);overflow:hidden;display:flex;flex-direction:column}
 .card.pareto{border-color:var(--accent)}
-.card img{width:100%;display:block;background:#fff;cursor:zoom-in}
 .card-body{padding:12px 13px 14px}
 .card h3{margin:0 0 6px;font-size:14px;display:flex;justify-content:space-between;align-items:center}
 .tag{font-size:10.5px;background:var(--accent);color:#06110d;border-radius:4px;padding:2px 6px;font-weight:700}
@@ -53,10 +52,6 @@ tr.is-pareto td:first-child{border-left:3px solid var(--accent)}
 .modal-inner{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);
 padding:22px;max-width:1050px;width:100%;max-height:90vh;overflow:auto;position:relative}
 .close{position:absolute;top:12px;right:16px;background:none;border:none;color:var(--dim);font-size:26px;cursor:pointer;line-height:1}
-.views{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:14px;margin:16px 0 20px}
-.views figure{margin:0}
-.views img{width:100%;background:#fff;border-radius:8px;display:block}
-.views figcaption{color:var(--dim);font-size:12px;text-align:center;margin-top:6px}
 .modal-actions{display:flex;gap:10px;flex-wrap:wrap}
 footer{border-top:1px solid var(--line);padding:18px 24px;color:var(--dim);font-size:12.5px;max-width:1180px;margin:0 auto}
 footer a{color:var(--accent)}
@@ -155,3 +150,34 @@ font-size:12px;color:var(--dim)}
 .pitch-box select option:disabled{color:#5a6070}
 .pitch-note{margin:0;font-size:11.5px;color:var(--dim);line-height:1.5}
 .pitch-note b{color:var(--fg);font-variant-numeric:tabular-nums}
+
+/* ---------- interactive model stages ---------- */
+/* A fixed aspect box, so ten cards do not reflow as their models stream in. */
+.stage3d{position:relative;aspect-ratio:4/3;background:
+  radial-gradient(120% 120% at 30% 15%, #1c2431 0%, #0f131a 70%);
+  border-bottom:1px solid var(--line);overflow:hidden;cursor:grab}
+.stage3d:active{cursor:grabbing}
+.stage3d.big{aspect-ratio:16/10;border:1px solid var(--line);
+  border-radius:10px;margin:16px 0 18px}
+.stage3d canvas{display:block;width:100%;height:100%;opacity:0;transition:opacity .35s}
+.stage3d.ready canvas{opacity:1}
+.stage3d .loading{position:absolute;inset:0;display:flex;align-items:center;
+  justify-content:center;color:var(--dim);font-size:12.5px;pointer-events:none}
+.stage3d.ready .loading{display:none}
+/* attr() can only read the pseudo-element's own host, so the
+   message text is set from JS; this only colours it. */
+.stage3d[data-error] .loading{display:flex;color:#ff8f8f}
+.stage3d .hint3d{position:absolute;left:0;right:0;bottom:6px;text-align:center;
+  color:var(--dim);font-size:10.5px;opacity:0;transition:opacity .2s;pointer-events:none}
+.stage3d.ready:hover .hint3d{opacity:.85}
+.btn.toggle{display:inline-flex;align-items:center;gap:7px;cursor:pointer;
+  font-size:13px}
+.btn.toggle input{width:13px;height:13px;margin:0;accent-color:var(--accent);
+  flex:0 0 auto}
+.swatch-a,.swatch-b{display:inline-block;width:9px;height:9px;border-radius:2px;
+  margin-right:5px;vertical-align:baseline}
+.swatch-a{background:rgb(27,158,119)}
+.swatch-b{background:rgb(217,95,2)}
+@media (prefers-reduced-motion:reduce){
+  .stage3d canvas,.stage3d .hint3d{transition:none}
+}

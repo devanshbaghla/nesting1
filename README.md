@@ -2,10 +2,8 @@
 
 Upload an STL, get back the top *N* ways to arrange **two copies** of that part
 in the smallest bounding box, with a guaranteed minimum surface-to-surface
-clearance. Each arrangement comes with an isometric preview, downloadable
-top / bottom / front views, and the nested STL.
-
-![contact sheet](docs/example_contact_sheet.png)
+clearance. Each arrangement comes back as an interactive isometric view you can
+orbit in the browser, plus the nested STL and a glTF-binary model.
 
 ---
 
@@ -47,8 +45,9 @@ python -m tests.test_smoke
 | Artefact | Where |
 |---|---|
 | `*_nest_01.stl` … `*_nest_10.stl` | one nested pair per recommendation |
-| isometric preview | rendered eagerly, shown in the results grid |
-| top / bottom / front PNGs | rendered on demand, **"2D views"** button → ZIP |
+| `*_nest_01.glb` … `*_nest_10.glb` | the same pair as glTF-binary, two coloured nodes |
+| `*_part.glb` | the input part on its own |
+| interactive iso view | drawn in the browser from the GLB, in the results grid |
 | `recommendations.json` / `.md` | metrics, transforms, audit, validation results |
 | `all.zip` | everything at once |
 
@@ -60,10 +59,9 @@ python -m tests.test_smoke
 |---|---|---|
 | `POST` | `/api/jobs` | upload an STL → `{job_id}` |
 | `GET` | `/api/jobs/{id}` | status, progress, log, recommendations |
-| `GET` | `/api/jobs/{id}/rec/{rank}/image/{view}` | PNG; `iso`, `top`, `bottom`, `front`, `back`, `left`, `right` |
+| `GET` | `/api/jobs/{id}/rec/{rank}/model.glb` | the nested pair as glTF-binary |
 | `GET` | `/api/jobs/{id}/rec/{rank}/stl` | download that arrangement |
-| `GET` | `/api/jobs/{id}/rec/{rank}/views.zip` | top + bottom + front + combined sheet |
-| `GET` | `/api/jobs/{id}/all.zip` | every STL, preview and the report |
+| `GET` | `/api/jobs/{id}/all.zip` | every STL, GLB and the report |
 | `GET` | `/api/jobs/{id}/report` | full JSON report |
 | `GET` | `/api/algorithms` | the algorithm registry |
 | `DELETE` | `/api/jobs/{id}` | delete a job and its files |
@@ -97,7 +95,7 @@ curl -F file=@part.stl -F clearance=5 -F top_n=10 -F profile=quick \
 
 ```
 upload → audit (gate) → self-tests (gate) → coarse orientation sweep
-       → fine sweep → diversify → refine each → export → verify → render
+       → fine sweep → diversify → refine each → export (STL + GLB) → verify
 ```
 
 1. **Voxelise** by z-scanline parity fill on a shared lattice — exact solid
@@ -268,7 +266,6 @@ NEST_JOB_WORKERS     concurrent jobs             (1)
 NEST_DISTANCE_BACKEND sampled | bvh              (sampled)
 NEST_JOB_TTL_HOURS   artefact retention          (24)
 NEST_DEFAULT_PROFILE quick | standard | full     (quick)
-NEST_RENDER_DPI      PNG resolution              (110)
 ```
 
 ---
@@ -279,22 +276,32 @@ NEST_RENDER_DPI      PNG resolution              (110)
 app/
   main.py              FastAPI routes
   jobs.py              job store, worker pool, progress bridge
-  renders.py           painter's-algorithm iso + orthographic renderer
   config.py            settings
   core/
     nesting3d.py       all geometry algorithms as classes
     nesting_factory.py registry + factory
     nest_base.py       recommendation driver
   templates/index.html
-  static/{app.js,style.css}
+  static/{app.js,viewer.js,style.css}
+  static/vendor/         three.js r160 + OrbitControls + GLTFLoader (upstream layout)
 tests/test_smoke.py    end-to-end: upload → poll → fetch every artefact
 cli.py                 command-line entry point
 ```
 
-Rendering uses a painter's algorithm rather than an interactive 3D backend:
-servers have no GPU, and matplotlib's mplot3d does not depth-sort reliably
-across two interpenetrating bodies — parts of the rear copy leak in front of
-the near one, which on a nesting result reads as a broken interlock.
+Views are drawn in the browser, not on the server. Profiling made the old way
+indefensible: on `electric_drill.stl` stage 8's three preview images cost
+**22.6 s** measured back to back against the **0.15 s** the GLB writes take now
+— 155x — and on a 300k-face part one shaded `Poly3DCollection` alone cost
+232.7 s, because mplot3d builds a `Path` object and a masked array per triangle.
+None of it fed the result. End to end the drill went from a median 92.1 s to
+74.0 s on the `quick` profile, with byte-identical geometry.
+
+The pipeline now writes one GLB per arrangement while both copies are still in
+memory — serialisation only, no rasterising and no depth sort — and three.js
+orbits it client-side. That removed the render stage outright, needs no GPU on
+the server, and replaced every fixed viewpoint with all of them: the side
+elevation that confirms an interlock is something you rotate to, and
+depth-sorting is the GPU's problem instead of a painter's algorithm's.
 
 ## Licence
 
