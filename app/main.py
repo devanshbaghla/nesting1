@@ -1,6 +1,6 @@
 """
-FastAPI application: upload an STL, get the top N nested arrangements back
-with isometric previews and downloadable orthographic views.
+FastAPI application: upload an STL, get the top N nested arrangements back,
+each as an interactive glTF-binary model you can orbit in the browser.
 
     uvicorn app.main:app --reload
 
@@ -11,9 +11,8 @@ POST /api/jobs                               upload an STL, returns a job id
 GET  /api/jobs                               list jobs
 GET  /api/jobs/{id}                          status, progress, recommendations
 DELETE /api/jobs/{id}                        remove a job and its artefacts
-GET  /api/jobs/{id}/rec/{rank}/image/{view}  PNG, view in iso|top|bottom|front|...
+GET  /api/jobs/{id}/rec/{rank}/model.glb     the nested pair, two coloured nodes
 GET  /api/jobs/{id}/rec/{rank}/stl           download the nested STL
-GET  /api/jobs/{id}/rec/{rank}/views.zip     top + bottom + front PNGs, zipped
 GET  /api/jobs/{id}/report                   full JSON report
 GET  /api/algorithms                         the algorithm registry
 GET  /api/health
@@ -38,7 +37,6 @@ from . import config
 from .core.nesting3d import HAVE_FCL
 from .core.nesting_factory import PROFILES, AlgorithmRegistry
 from .jobs import store, validate_upload
-from .renders import DOWNLOADABLE, VIEWS, render, render_sheet
 
 BASE = Path(__file__).resolve().parent
 app = FastAPI(title="STL Nesting Service", version="1.0.0",
@@ -165,25 +163,23 @@ def report(job_id: str):
 # --------------------------------------------------------------------------- #
 #  Per-recommendation artefacts
 # --------------------------------------------------------------------------- #
-@app.get("/api/jobs/{job_id}/rec/{rank}/image/{view}")
-def rec_image(job_id: str, rank: int, view: str):
-    """Isometric views are rendered up front; the rest on first request.
+@app.get("/api/jobs/{job_id}/rec/{rank}/model.glb")
+def rec_model(job_id: str, rank: int):
+    """The nested pair as glTF-binary, for the viewer in the results page.
 
-    Rendering all seven views for every recommendation would add roughly a
-    minute to a ten-candidate job for images most people never open, so only
-    the isometric is eager. Everything else is cached to disk on first hit.
+    Written during export, not on request: the pipeline serialises it while
+    both copies are still in memory, so this route only ever reads a file off
+    disk. It replaced seven server-rendered PNG viewpoints -- the browser can
+    reach any of them, and more, by orbiting.
     """
     job, rec = _rec(job_id, rank)
-    if view not in VIEWS:
-        raise HTTPException(400, f"view must be one of {list(VIEWS)}")
-    png = job.dir / f"rec_{rank:02d}_{view}.png"
-    if not png.exists():
-        stl = job.dir / rec["stl"]
-        if not stl.exists():
-            raise HTTPException(404, "STL missing for this recommendation")
-        render(stl, view, png, dpi=config.RENDER_DPI,
-               label=f"#{rank}  {view.upper()}")
-    return FileResponse(png, media_type="image/png",
+    name = rec.get("glb")
+    if not name:
+        raise HTTPException(404, "this job has no model for that rank")
+    path = job.dir / name
+    if not path.exists():
+        raise HTTPException(404, "model not found")
+    return FileResponse(path, media_type="model/gltf-binary",
                         headers={"Cache-Control": "public, max-age=86400"})
 
 
@@ -198,40 +194,9 @@ def rec_stl(job_id: str, rank: int):
                         filename=f"{stem}_nested_{rank:02d}.stl")
 
 
-@app.get("/api/jobs/{job_id}/rec/{rank}/views.zip")
-def rec_views_zip(job_id: str, rank: int, sheet: bool = True):
-    """Top, bottom and front as PNGs, plus a combined sheet, zipped."""
-    job, rec = _rec(job_id, rank)
-    stl = job.dir / rec["stl"]
-    stem = Path(job.filename).stem
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        for view in DOWNLOADABLE:
-            png = job.dir / f"rec_{rank:02d}_{view}.png"
-            if not png.exists():
-                render(stl, view, png, dpi=config.RENDER_DPI,
-                       label=f"#{rank}  {view.upper()}")
-            zf.write(png, f"{stem}_nest{rank:02d}_{view}.png")
-        if sheet:
-            sh = job.dir / f"rec_{rank:02d}_sheet.png"
-            if not sh.exists():
-                render_sheet(stl, sh, dpi=config.RENDER_DPI,
-                             label=f"#{rank}  {rec['extents'][0]}x"
-                                   f"{rec['extents'][1]}x{rec['extents'][2]} mm  "
-                                   f"gap {rec['gap']} mm")
-            zf.write(sh, f"{stem}_nest{rank:02d}_all_views.png")
-        zf.writestr(f"{stem}_nest{rank:02d}_metrics.json",
-                    json.dumps(rec, indent=2))
-    buf.seek(0)
-    return StreamingResponse(
-        buf, media_type="application/zip",
-        headers={"Content-Disposition":
-                 f'attachment; filename="{stem}_nest{rank:02d}_views.zip"'})
-
-
 @app.get("/api/jobs/{job_id}/all.zip")
 def all_zip(job_id: str):
-    """Every recommendation: STLs, isometric previews and the report."""
+    """Every recommendation: STLs, interactive GLB models and the report."""
     job = _job(job_id)
     if job.status != "done":
         raise HTTPException(409, "job is not finished")
@@ -239,10 +204,10 @@ def all_zip(job_id: str):
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         for rec in job.recommendations:
-            for key in ("stl", "iso"):
-                p = job.dir / rec[key]
-                if p.exists():
-                    zf.write(p, p.name)
+            for key in ("stl", "glb"):
+                name = rec.get(key)
+                if name and (job.dir / name).exists():
+                    zf.write(job.dir / name, name)
         for extra in ("recommendations.json", "recommendations.md"):
             p = job.dir / extra
             if p.exists():

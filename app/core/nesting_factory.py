@@ -155,11 +155,11 @@ AlgorithmRegistry.add("validation", "distance_agreement",
 AlgorithmRegistry.add("validation", "clearance_met", Validation.clearance_met,
                       note="final gate on the delivered pose")
 
-# -- rendering -------------------------------------------------------------- #
-AlgorithmRegistry.add("render", "part_views", Preview.part_views,
-                      note="single-part ortho projection; finds pockets")
-AlgorithmRegistry.add("render", "pair", Preview.render,
-                      note="ortho + isometric of the nested pair")
+# -- model export ----------------------------------------------------------- #
+AlgorithmRegistry.add("export", "part_glb", Preview.part_glb,
+                      note="the input part as glTF-binary, for inspection")
+AlgorithmRegistry.add("export", "pair_glb", Preview.pair_glb,
+                      note="nested pair as glTF-binary; one node per copy")
 
 
 # --------------------------------------------------------------------------- #

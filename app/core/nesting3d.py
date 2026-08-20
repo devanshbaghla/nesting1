@@ -64,6 +64,7 @@ from __future__ import annotations
 import json
 import threading
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Callable, Iterable, Sequence
 
 import numpy as np
@@ -111,6 +112,25 @@ HAVE_FCL = fcl is not None
 #: out loud that it is serial, and so restoring the fan-out is a one-line
 #: change here rather than an edit to eleven call sites.
 KD_WORKERS = 1
+
+#: Neighbouring samples whose owning faces get an exact point-triangle test.
+#:
+#: The claim being hedged is statistical: area-weighted sampling puts a sample
+#: within about one spacing of the true closest point, so the face that owns it
+#: is very likely among the k nearest. k was 24 as a safety margin, chosen
+#: without measurement.
+#:
+#: Measured instead, over six parts at three poses each -- clear, near contact,
+#: and interpenetrating -- k=8 returns a distance identical to k=32 in all
+#: eighteen cases, while k=6 and below deviate by up to 7.2e-05 mm. Eight is
+#: therefore the smallest value that is not merely close but exact on this
+#: geometry, and it costs a third of what 24 did: _pt_tri went 0.0699s -> 0.0234s
+#: on the reference part, against 12.05% of all profiled time spent in _pt_tri
+#: and point_triangle_distance together.
+#:
+#: Raise it if a part ever disagrees with `exact_reference`, which is the
+#: independent check that would catch it.
+PT_TRI_K = 8
 
 
 # --------------------------------------------------------------------------- #
@@ -160,7 +180,7 @@ class MeshAudit:
         Caveat worth stating plainly: a convex hull FILLS every pocket, so this
         number alone cannot reveal a cavity and did not find the one on the
         reference part. Use it only as a coarse aspect-ratio read, and use
-        :meth:`Preview.part_views` to actually see concavity.
+        :meth:`Preview.part_glb` to actually see concavity.
         """
         from scipy.spatial import ConvexHull
         out = {}
@@ -257,7 +277,12 @@ class ScanlineVoxelizer:
             cols.append((ii + a) * ny + (jj + c))
             zhit.append(z)
 
-        acc = np.zeros((nx * ny, nz + 1), dtype=np.int32)
+        # int16, not int32: the array holds a difference count, and its
+        # magnitude is bounded by how many spans start or end in one cell --
+        # single digits on real geometry. It halves the largest allocation the
+        # voxeliser makes, which is what decides whether a big part fits in
+        # memory at all. Measured bit-identical, and 15% off the call.
+        acc = np.zeros((nx * ny, nz + 1), dtype=np.int16)
         if cols:
             col = np.concatenate(cols)
             z = np.concatenate(zhit)
@@ -287,7 +312,10 @@ class ScanlineVoxelizer:
             np.add.at(acc, (c_in[ok], k0[ok]), 1)          # difference array
             np.add.at(acc, (c_in[ok], k1[ok] + 1), -1)
 
-        occ = np.cumsum(acc, axis=1)[:, :nz] > 0
+        # accumulate in place: np.cumsum(acc) would allocate a second array
+        # the size of the lattice before `> 0` collapses it to a bool
+        np.cumsum(acc, axis=1, out=acc)
+        occ = acc[:, :nz] > 0
         return occ.reshape(nx, ny, nz), i0
 
     @classmethod
@@ -917,7 +945,7 @@ class SurfacePairDistance:
         return self.min_distance_to(self.treeA, pts + np.asarray(t, float),
                                     self.field)
 
-    def exact(self, t, k: int = 24, band: float = 0.8) -> float:
+    def exact(self, t, k: int = PT_TRI_K, band: float = 0.8) -> float:
         """Minimum surface distance with B translated by ``t``.
 
         Unchanged in what it computes. The sampled minimum still localises the
@@ -1090,7 +1118,7 @@ class BVHPairDistance:
         return model
 
     # -- metrics ----------------------------------------------------------- #
-    def exact(self, t, k: int = 24, band: float = 0.8) -> float:
+    def exact(self, t, k: int = PT_TRI_K, band: float = 0.8) -> float:
         """Minimum surface distance with B translated by ``t``.
 
         ``k`` and ``band`` tune the sampled metric's face lookup and have no
@@ -1390,90 +1418,65 @@ class Validation:
 
 
 # --------------------------------------------------------------------------- #
-#  Rendering
+#  Interactive model export
 # --------------------------------------------------------------------------- #
 class Preview:
-    """Orthographic + isometric render of the nested pair.
+    """glTF-binary export of a nested pair, for an interactive viewer.
 
-    Not decoration. The side elevation is how the interlock gets confirmed as
-    a real mating of features rather than two parts that merely happen to
-    share a bounding box, and it is the fastest way to catch a solution that
-    is numerically feasible but physically absurd (assembled through a wall,
-    or requiring one part to pass through the other to reach its pose).
+    This used to render PNGs with matplotlib: three orthographic projections
+    plus a shaded isometric subplot. It was replaced because it was the single
+    most expensive stage in the pipeline and none of it fed the result.
+    Measured on ``electric_drill.stl`` (quick profile), the three images cost
+    50.6 s of a 118.1 s run -- 42.8% -- and on ``Spanner-stl.stl`` one
+    ``Poly3DCollection(shade=True)`` alone cost 232.7 s of a 238.9 s render,
+    because mplot3d builds a Path object and a masked array per triangle.
+
+    A GLB carries the same geometry in one binary file that a browser can
+    orbit, so the viewer replaces every fixed viewpoint at once -- the side
+    elevation that confirms an interlock is now something you rotate to rather
+    than something the server has to guess in advance. Writing it is
+    serialisation only: no rasterising, no depth sort, no figure.
+
+    Each copy becomes its own named node with its own colour, so the two parts
+    stay tellable apart and the viewer can address them individually.
     """
 
-    @staticmethod
-    def part_views(mesh: trimesh.Trimesh, path: str, colour: str = "#2a7",
-                   dpi: int = 90):
-        """Orthographic triangle-projection render of a SINGLE part.
+    #: teal / orange, the colours the PNG renderer used, kept for continuity
+    COLOURS = ((27, 158, 119), (217, 95, 2))
 
-        This is the diagnostic that decides whether nesting is even worth
-        running, and where. Every triangle is projected to each coordinate
-        plane and overdrawn at low alpha, so interior voids stay light while
-        solid regions build up density — which is exactly how the open pocket
-        on the reference part was found (a 22 x 55 mm cavity in the Y-Z view,
-        invisible to any convex measure).
+    @staticmethod
+    def _material(rgb, name):
+        return trimesh.visual.material.PBRMaterial(
+            name=name,
+            baseColorFactor=[rgb[0] / 255, rgb[1] / 255, rgb[2] / 255, 1.0],
+            metallicFactor=0.05, roughnessFactor=0.65)
+
+    @classmethod
+    def pair_glb(cls, parts: Sequence[trimesh.Trimesh], path: str,
+                 names: Sequence[str] | None = None) -> str:
+        """Write ``parts`` to ``path`` as a single GLB, one node per part.
+
+        Materials rather than per-face colour arrays: a face-colour array costs
+        four bytes a triangle in the file and buys nothing here, because each
+        copy is one flat colour.
         """
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-        from matplotlib.collections import PolyCollection
+        scene = trimesh.Scene()
+        for i, part in enumerate(parts):
+            m = part.copy()
+            m.visual = trimesh.visual.TextureVisuals(
+                material=cls._material(cls.COLOURS[i % len(cls.COLOURS)],
+                                       f"copy_{i}"))
+            label = (names[i] if names and i < len(names)
+                     else f"copy_{chr(ord('A') + i)}")
+            scene.add_geometry(m, node_name=label, geom_name=label)
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        Path(path).write_bytes(scene.export(file_type="glb"))
+        return str(path)
 
-        v = mesh.vertices
-        fig, axes = plt.subplots(1, 3, figsize=(15, 7))
-        for ax, (a, b, ttl) in zip(axes, [(0, 2, "X-Z (front)"),
-                                          (1, 2, "Y-Z (side)"),
-                                          (0, 1, "X-Y (top)")]):
-            ax.add_collection(PolyCollection(mesh.triangles[:, :, [a, b]],
-                                             facecolors=colour,
-                                             edgecolors="none", alpha=0.06))
-            ax.set_xlim(v[:, a].min() - 3, v[:, a].max() + 3)
-            ax.set_ylim(v[:, b].min() - 3, v[:, b].max() + 3)
-            ax.set_aspect("equal"); ax.grid(alpha=0.3); ax.set_title(ttl)
-        plt.tight_layout(); plt.savefig(path, dpi=dpi); plt.close(fig)
-        return path
-
-    @staticmethod
-    def render(parts: Sequence[trimesh.Trimesh], path: str,
-               title: str = "", colours=("#1b9e77", "#d95f02"), dpi: int = 95):
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-        from matplotlib.collections import PolyCollection
-        from mpl_toolkits.mplot3d.art3d import Poly3DCollection
-
-        lo = np.minimum.reduce([p.bounds[0] for p in parts])
-        hi = np.maximum.reduce([p.bounds[1] for p in parts])
-        e = hi - lo
-        fig = plt.figure(figsize=(16, 8.5))
-        views = [(1, 2, "Side (Y-Z) — interlock"), (0, 2, "Front (X-Z)"),
-                 (0, 1, "Top (X-Y) — footprint")]
-        for n, (a, b, ttl) in enumerate(views):
-            ax = fig.add_subplot(1, 4, n + 1)
-            for m, c in zip(parts, colours):
-                ax.add_collection(PolyCollection(m.triangles[:, :, [a, b]],
-                                                 facecolors=c, edgecolors="none",
-                                                 alpha=0.08))
-            ax.add_patch(plt.Rectangle((lo[a], lo[b]), e[a], e[b], fill=False,
-                                       ec="k", lw=1.2, ls="--"))
-            ax.set_xlim(lo[a] - 6, hi[a] + 6); ax.set_ylim(lo[b] - 6, hi[b] + 6)
-            ax.set_aspect("equal"); ax.grid(alpha=0.25)
-            ax.set_title(f"{ttl}\n{e[a]:.1f} x {e[b]:.1f} mm", fontsize=10)
-        ax = fig.add_subplot(1, 4, 4, projection="3d")
-        for m, c in zip(parts, colours):
-            rgba = np.tile(matplotlib.colors.to_rgba(c), (len(m.faces), 1))
-            ax.add_collection3d(Poly3DCollection(m.triangles, facecolors=rgba,
-                                                 shade=True, alpha=0.55))
-        span = e.max()
-        ax.set_xlim(lo[0], lo[0] + span * .45); ax.set_ylim(lo[1], lo[1] + span * .45)
-        ax.set_zlim(lo[2], lo[2] + span)
-        ax.set_box_aspect((.45, .45, 1)); ax.view_init(22, 35)
-        ax.set_xticks([]); ax.set_yticks([]); ax.set_zticks([])
-        ax.set_title("Nested pair", fontsize=10)
-        if title:
-            fig.suptitle(title, fontsize=12)
-        plt.tight_layout(); plt.savefig(path, dpi=dpi); plt.close(fig)
-        return path
+    @classmethod
+    def part_glb(cls, mesh: trimesh.Trimesh, path: str) -> str:
+        """Write a single part, for inspecting the input before nesting."""
+        return cls.pair_glb([mesh], path, names=["part"])
 
 
 # --------------------------------------------------------------------------- #
@@ -1663,10 +1666,9 @@ class PairNester:
         return path
 
     def preview(self, path: str, origin_corner: bool = True) -> str:
-        """Render the nested pair; see :class:`Preview` for why this matters."""
+        """Write the nested pair as a GLB; see :class:`Preview` for why."""
         parts = self.assembly(origin_corner).split(only_watertight=False)
-        r = self.result
-        return Preview.render(parts, path, title=r.summary() if r else "")
+        return Preview.pair_glb(parts, path)
 
     def verify(self, path: str, n_samples: int = 250_000, seed: int = 12345) -> dict:
         """Re-measure the written file from scratch: bodies, volumes, true gap."""
@@ -1907,63 +1909,6 @@ class Inspector:
             return [(float((i0[axis] + k + 0.5) * pitch), float(counts[k] * pitch ** 2))
                     for k in idx]
 
-    @staticmethod
-    def render(assembly_or_mesh, path: str, title: str = ""):
-        """Three orthographic silhouettes plus an isometric view.
-
-        Silhouettes are drawn by projecting triangles straight to 2D polygons
-        with heavy alpha — no hidden-surface removal, so overlap reads as
-        density. That is exactly what you want when judging an interlock.
-        """
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-        from matplotlib.collections import PolyCollection
-        from mpl_toolkits.mplot3d.art3d import Poly3DCollection
-
-        m = assembly_or_mesh
-        try:
-            bodies = m.split(only_watertight=False)
-        except Exception:
-            bodies = [m]
-        if len(bodies) == 0:
-            bodies = [m]
-        colours = ["#1b9e77", "#d95f02", "#7570b3", "#e7298a"]
-        lo, hi = m.bounds
-        ext = hi - lo
-        fig = plt.figure(figsize=(16, 8.5))
-        for n, (a, b, name) in enumerate([(1, 2, "Side (Y-Z)"), (0, 2, "Front (X-Z)"),
-                                          (0, 1, "Top (X-Y)")]):
-            ax = fig.add_subplot(1, 4, n + 1)
-            for k, body in enumerate(bodies):
-                ax.add_collection(PolyCollection(body.triangles[:, :, [a, b]],
-                                                 facecolors=colours[k % 4],
-                                                 edgecolors="none", alpha=0.08))
-            ax.add_patch(plt.Rectangle((lo[a], lo[b]), ext[a], ext[b], fill=False,
-                                       ec="k", lw=1.2, ls="--"))
-            ax.set_xlim(lo[a] - 6, hi[a] + 6)
-            ax.set_ylim(lo[b] - 6, hi[b] + 6)
-            ax.set_aspect("equal")
-            ax.set_title(f"{name}\n{ext[a]:.1f} x {ext[b]:.1f} mm", fontsize=10)
-            ax.grid(alpha=.25)
-        ax = fig.add_subplot(1, 4, 4, projection="3d")
-        for k, body in enumerate(bodies):
-            rgba = matplotlib.colors.to_rgba(colours[k % 4])
-            ax.add_collection3d(Poly3DCollection(
-                body.triangles, facecolors=np.tile(rgba, (len(body.faces), 1)),
-                shade=True, alpha=.55))
-        big = ext.max()
-        ax.set_xlim(lo[0], lo[0] + big); ax.set_ylim(lo[1], lo[1] + big)
-        ax.set_zlim(lo[2], lo[2] + big)
-        ax.set_box_aspect((1, 1, 1)); ax.view_init(22, 35)
-        ax.set_xticks([]); ax.set_yticks([]); ax.set_zticks([])
-        ax.set_title("Isometric", fontsize=10)
-        if title:
-            fig.suptitle(title, fontsize=12)
-        plt.tight_layout()
-        plt.savefig(path, dpi=95)
-        plt.close(fig)
-        return path
 
 
 # =========================================================================== #
@@ -1975,7 +1920,6 @@ class Inspector:
 ALGORITHMS = [
     # stage,            name,                                    status,     where
     ("recon",  "AABB vs OBB principal-frame check",              "used",     "Inspector.report"),
-    ("recon",  "orthographic silhouette projection",             "used",     "Inspector.render"),
     ("recon",  "planar cross-section profile",                   "used",     "Inspector.slice_profile"),
     ("voxel",  "z-scanline parity solid voxelisation",           "used",     "ScanlineVoxelizer"),
     ("voxel",  "irrational jitter + widened column window",      "used",     "ScanlineVoxelizer"),

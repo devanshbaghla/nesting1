@@ -80,7 +80,7 @@
         <button type="button" id="again" class="btn ghost">New part</button>
       </div>
     </div>
-    <p class="legend"><span class="pareto-dot"></span> Pareto-optimal — not beaten on both volume and footprint. Others are shown for comparison.</p>
+    <p class="legend"><span class="swatch-a"></span> copy A <span class="swatch-b"></span> copy B &nbsp;·&nbsp; <span class="pareto-dot"></span> Pareto-optimal — not beaten on both volume and footprint. Others are shown for comparison.</p>
     <table id="summary"><thead><tr>
       <th>#</th><th>Bounding box (mm)</th><th>Volume (mm³)</th><th>Footprint (mm²)</th><th>Height</th><th>Gap</th><th></th>
     </tr></thead><tbody></tbody></table>
@@ -92,15 +92,25 @@
   <div class="modal-inner">
     <button class="close" id="modal-close">&times;</button>
     <h3 id="modal-title"></h3>
-    <div class="views" id="modal-views"></div>
+    <div class="stage3d big" id="modal-stage">
+      <canvas id="modal-canvas"></canvas>
+      <span class="loading">loading model&hellip;</span>
+      <span class="hint3d">drag to rotate &middot; scroll to zoom &middot; right-drag to pan</span>
+    </div>
     <div class="modal-actions">
-      <a class="btn" id="modal-zip" href="#">Download top / bottom / front (ZIP)</a>
+      <button type="button" class="btn ghost" id="view-reset">Reset to iso</button>
+      <button type="button" class="btn ghost" id="view-isolate">Isolate a copy</button>
+      <label class="btn ghost toggle"><input type="checkbox" id="view-spin"> Spin</label>
+      <a class="btn" id="modal-glb" href="#" download>Download GLB</a>
       <a class="btn ghost" id="modal-stl" href="#">Download STL</a>
     </div>
   </div>
 </div>
 
 <footer><p>Engine: exact scanline voxelisation → FFT translation search → continuous refinement against exact point-to-triangle distance. <a href="/docs">API docs</a> · <a href="/api/algorithms">algorithms</a></p></footer>
-<script src="/static/app.js"></script>
+<script type="importmap">
+{"imports": {"three": "/static/vendor/three.module.js"}}
+</script>
+<script type="module" src="/static/app.js"></script>
 </body>
 </html>

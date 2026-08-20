@@ -6,11 +6,11 @@ nest_base.py — STL in, top-N nested arrangements out.
     python nest_base.py part.stl --objective footprint
     python nest_base.py --describe
 
-Writes one STL per recommendation plus a contact sheet and a report:
+Writes one STL and one GLB per recommendation, plus a report:
 
     part_nest_01.stl ... part_nest_10.stl
-    part_part_views.png        single-part diagnostic
-    part_contact_sheet.png     all candidates side by side
+    part_nest_01.glb ... part_nest_10.glb   two coloured nodes, orbit in a browser
+    part_part.glb                           the input part on its own
     recommendations.json / .md
 
 Why several recommendations rather than one
@@ -68,6 +68,7 @@ class Recommendation:
     refined: bool
     pareto: bool = False
     stl: str = ""
+    glb: str = ""
     verified: dict = field(default_factory=dict)
     note: str = ""
 
@@ -293,9 +294,19 @@ class NestingRecommender:
         return trimesh.util.concatenate([A, B]), A, B
 
     def export_one(self, mesh, rec: Recommendation, path: Path):
-        asm, _, _ = self._assembly(mesh, np.array(rec.transform))
+        """Write the pair as STL, and as GLB for the interactive viewer.
+
+        Both come out of one ``_assembly`` call. The GLB is written from the
+        separate ``A``/``B`` copies rather than the concatenated assembly so
+        each stays its own node with its own colour, and it costs nothing
+        extra: the geometry is already in memory and this is serialisation
+        only. Writing it here instead of re-loading the STL afterwards is what
+        removed the render stage from the pipeline.
+        """
+        asm, A, B = self._assembly(mesh, np.array(rec.transform))
         asm.export(str(path))
         rec.stl = str(path)
+        rec.glb = Preview.pair_glb([A, B], str(path.with_suffix(".glb")))
 
     def verify_one(self, path: str, full: bool, n_faces: int | None = None,
                    mesh=None, transform=None) -> dict:
@@ -413,44 +424,7 @@ class NestingRecommender:
                  and (o.volume < r.volume or o.footprint < r.footprint))
                 for o in recs if o is not r)
 
-    # -- 8. contact sheet -------------------------------------------------- #
-    def contact_sheet(self, mesh, recs, path):
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-        from matplotlib.collections import PolyCollection
-
-        n = len(recs)
-        cols = min(5, n)
-        rows = int(np.ceil(n / cols))
-        fig, axes = plt.subplots(rows, cols, figsize=(3.0 * cols, 4.4 * rows),
-                                 squeeze=False)
-        for ax in axes.ravel():
-            ax.axis("off")
-        for i, rec in enumerate(recs):
-            ax = axes[i // cols][i % cols]
-            ax.axis("on"); ax.set_xticks([]); ax.set_yticks([])
-            _, A, B = self._assembly(mesh, np.array(rec.transform))
-            for m, c in ((A, "#1b9e77"), (B, "#d95f02")):
-                ax.add_collection(PolyCollection(m.triangles[:, :, [1, 2]],
-                                                 facecolors=c, edgecolors="none",
-                                                 alpha=0.09))
-            lo = np.minimum(A.bounds[0], B.bounds[0])
-            hi = np.maximum(A.bounds[1], B.bounds[1])
-            ax.add_patch(plt.Rectangle((lo[1], lo[2]), hi[1] - lo[1], hi[2] - lo[2],
-                                       fill=False, ec="k", lw=1.0, ls="--"))
-            ax.set_xlim(lo[1] - 5, hi[1] + 5); ax.set_ylim(lo[2] - 5, hi[2] + 5)
-            ax.set_aspect("equal")
-            e = rec.extents
-            ax.set_title(f"#{rec.rank}{' *' if rec.pareto else ''}  "
-                         f"{e[0]:.0f}x{e[1]:.0f}x{e[2]:.0f}\n"
-                         f"{rec.volume:,.0f} mm3 | {rec.footprint:,.0f} mm2",
-                         fontsize=8)
-        fig.suptitle("Nested candidates (Y-Z view)   * = Pareto-optimal",
-                     fontsize=11)
-        plt.tight_layout(); plt.savefig(path, dpi=95); plt.close(fig)
-        return str(path)
-
+    # -- 8. report --------------------------------------------------------- #
     # -- main -------------------------------------------------------------- #
     def recommend(self, stl_path, out_dir="nest_out", top_n=None) -> list[Recommendation]:
         """Run the pipeline, reusing part A's samples across every candidate.
@@ -535,26 +509,22 @@ class NestingRecommender:
                                          n_faces=len(mesh.faces),
                                          mesh=mesh, transform=r.transform)
 
-        self._log("[8/8] renders and report")
-        Preview.part_views(mesh, str(out_dir / f"{stl_path.stem}_part_views.png"))
-        sheet = self.contact_sheet(mesh, recs,
-                                   out_dir / f"{stl_path.stem}_contact_sheet.png")
-        best = recs[0]
-        top_asm, A, B = self._assembly(mesh, np.array(best.transform))
-        Preview.render(top_asm.split(only_watertight=False),
-                       str(out_dir / f"{stl_path.stem}_best_preview.png"),
-                       title=f"best by {self.cfg.objective}: "
-                             f"{best.volume:,.0f} mm3, gap {best.gap:.3f}")
+        self._log("[8/8] report")
+        # every recommendation already has its GLB from export_one, so there is
+        # nothing left to draw here; the input part gets one too, because the
+        # question "is this part even worth nesting" is answered by looking at
+        # it, and that used to be what part_views was for
+        part_glb = Preview.part_glb(
+            mesh, str(out_dir / f"{stl_path.stem}_part.glb"))
 
-        nester = PairNester(mesh, self.cfg.clearance, verbose=False)
-        baselines = nester.baselines()
+        baselines = PairNester(mesh, self.cfg.clearance, verbose=False).baselines()
         self._write_report(out_dir, stl_path, mesh, recs, audit, tests, baselines)
 
         self._log(f"\n rank   bbox (mm)                 volume    footprint    gap  P  label")
         for r in recs:
             self._log(" " + r.row())
         self._log(f"\ncompleted in {time.time()-t_all:.0f}s -> {out_dir}")
-        self._log(f"contact sheet: {sheet}")
+        self._log(f"part model: {part_glb}")
         return recs
 
     @staticmethod
