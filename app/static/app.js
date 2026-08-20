@@ -3,7 +3,8 @@ import {PartViewer} from './viewer.js';
 const $ = (s) => document.querySelector(s);
 const fmt = (n) => n.toLocaleString(undefined, {maximumFractionDigits: 0});
 const dim = (n) => n.toLocaleString(undefined, {maximumFractionDigits: 2});
-let jobId = null, poller = null, viewer = null;
+let jobId = null, poller = null, viewer = null, selected = null;
+let ratio = 0.02, reclassifyTimer = null, pitch = null;
 
 /* ---------- upload ---------- */
 const dz = $('#dropzone'), fileInput = $('#file');
@@ -52,7 +53,9 @@ $('#upload-form').onsubmit = async (e) => {
 };
 
 /* ---------- preview ---------- */
+let lastPreview = null;
 function renderPreview(p) {
+  lastPreview = p;
   $('#preview-summary').textContent = p.summary;
   $('#preview-summary').className = 'summary' + (p.has_noise ? ' warn' : ' ok');
 
@@ -66,26 +69,36 @@ function renderPreview(p) {
     ['Watertight', p.watertight ? 'yes' : 'no'],
   ].map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join('');
 
+  ratio = p.ratio;
+  $('#ratio').value = p.ratio;
+  $('#ratio-out').textContent =
+    `${(p.ratio * 100).toFixed(1)}% — under ${dim(p.threshold)}`;
   $('#preview-rule').innerHTML =
-    `A body is <b>noise</b> only when it is <b>both</b> detached from the object
-     — standing more than <b>${dim(p.touch_tolerance)}</b> clear of it — and
-     under <b>${dim(p.threshold)}</b> across, which is
-     <b>${(p.ratio * 100).toFixed(0)}%</b> of the object's smallest dimension
-     (${dim(p.object_smallest)}). Anything touching the object is kept whatever
-     its size.`;
+    `A body is <b>noise</b> only when it is small <b>both</b> ways: under
+     <b>${dim(p.threshold)}</b> across (${(p.ratio * 100).toFixed(1)}% of the
+     object's smallest dimension, ${dim(p.object_smallest)}) <b>and</b> under
+     <b>${dim(p.area_limit)}</b> of surface. Anything carrying real surface is
+     structure and stays, however small its box. Distance is context only.`;
 
   const frags = p.bodies > 1 ? p.fragments : [];
   $('#frag-list').innerHTML = frags.length ? frags
     .slice()
     .sort((a, b) => (b.is_noise - a.is_noise) || (b.largest - a.largest))
     .map(f => `
-      <div class="frag ${f.is_noise ? 'is-noise' : ''}" title="${f.reason}">
+      <button type="button" class="frag ${f.is_noise ? 'is-noise' : ''}"
+              data-body="${f.index}" title="${f.reason} — click to highlight">
         <span class="dot"></span>
         <span class="frag-id">body ${f.index}</span>
         <span class="frag-size">${dim(f.extents[0])} × ${dim(f.extents[1])} × ${dim(f.extents[2])}</span>
         <span class="frag-max">${f.gap === null ? '' : 'gap ' + dim(f.gap)}</span>
         <span class="frag-tag">${f.is_noise ? 'NOISE' : 'keep'}</span>
-      </div>`).join('') : '';
+      </button>`).join('') : '';
+  selected = null;
+  $('#frag-list').querySelectorAll('.frag').forEach(el => {
+    el.onclick = () => selectBody(Number(el.dataset.body), el);
+  });
+
+  renderPitch(p);
 
   const btn = $('#denoise');
   btn.disabled = !p.has_noise;
@@ -101,14 +114,59 @@ function renderPreview(p) {
     : '';
 }
 
+/* The translation search allocates one array per orientation, sized by the
+   part and the pitch. On a large part the engine default is tens of GB, so the
+   cost of every option is shown and the unaffordable ones are disabled. */
+function renderPitch(p) {
+  const sel = $('#pitch');
+  const opts = p.pitch_options || [];
+  if (!opts.length) { $('.pitch-box').classList.add('hidden'); return; }
+  $('.pitch-box').classList.remove('hidden');
+
+  if (pitch === null) pitch = p.suggested_pitch;
+  sel.innerHTML = opts.map(o => {
+    const gb = o.bytes / (1024 ** 3);
+    const size = gb >= 0.1 ? `${gb.toFixed(2)} GB` : `${(gb * 1024).toFixed(0)} MB`;
+    return `<option value="${o.pitch}" ${o.within_budget ? '' : 'disabled'}
+                    ${o.pitch === pitch ? 'selected' : ''}>
+              ${o.pitch} mm — ${size}${o.within_budget ? '' : ' (too large)'}
+            </option>`;
+  }).join('');
+  if (sel.selectedIndex < 0 || sel.options[sel.selectedIndex].disabled) {
+    sel.value = String(p.suggested_pitch);
+    pitch = p.suggested_pitch;
+  }
+  describePitch(p);
+}
+
+function describePitch(p) {
+  const o = (p.pitch_options || []).find(x => x.pitch === pitch);
+  $('#pitch-out').textContent = pitch ? `${pitch} mm fine` : 'engine default';
+  if (!o) { $('#pitch-note').textContent = ''; return; }
+  const gb = o.bytes / (1024 ** 3);
+  $('#pitch-note').innerHTML =
+    `Translation search allocates <b>${o.shape.join(' × ')}</b> voxels
+     (${gb >= 0.1 ? gb.toFixed(2) + ' GB' : (gb * 1024).toFixed(0) + ' MB'})
+     per orientation. A finer pitch searches on a tighter lattice; refinement
+     recovers the slack either way.` +
+    (pitch > p.suggested_pitch
+      ? ' <b>Coarser than needed</b> — a finer pitch would still fit.' : '');
+}
+
+$('#pitch').onchange = (e) => {
+  pitch = Number(e.target.value);
+  describePitch(lastPreview);
+};
+
 async function loadGeometry() {
   const el = $('#viewer-loading');
   el.classList.remove('hidden');
   try {
-    const r = await fetch(`/api/preview/${jobId}/geometry`);
+    const r = await fetch(`/api/preview/${jobId}/geometry?ratio=${ratio}`);
     const payload = await r.json();
     if (!r.ok) throw new Error(payload.detail || 'could not read geometry');
     if (!viewer) viewer = new PartViewer($('#preview-canvas'));
+    clearSelection();
     viewer.load(payload);
     viewer.setNoiseVisible($('#toggle-noise').checked);
     viewer.setPartOpacity($('#toggle-ghost').checked ? 0.25 : 1);
@@ -123,7 +181,64 @@ async function loadGeometry() {
   el.classList.add('hidden');
 }
 
-$('#view-reset').onclick = () => viewer && viewer.resetView();
+/* ---------- inspecting one body ---------- */
+async function selectBody(index, row) {
+  if (!viewer) return;
+  if (selected === index) { clearSelection(); return; }   // click again to drop
+
+  $('#frag-list').querySelectorAll('.frag').forEach(e => e.classList.remove('on'));
+  row.classList.add('on');
+  selected = index;
+  $('#body-info').textContent = 'loading body…';
+  show('#body-bar');
+  try {
+    const r = await fetch(`/api/preview/${jobId}/body/${index}?ratio=${ratio}`);
+    const b = await r.json();
+    if (!r.ok) throw new Error(b.detail || 'could not read that body');
+    if (selected !== index) return;                       // a later click won
+    viewer.selectBody(b);
+    const f = b.fragment, e = f.extents;
+    $('#body-info').innerHTML =
+      `<b>body ${index}</b> — ${fmt(f.faces)} triangles ·
+       ${dim(e[0])} × ${dim(e[1])} × ${dim(e[2])} · ${f.reason}`;
+  } catch (err) {
+    $('#body-info').textContent = err.message;
+  }
+}
+
+function clearSelection() {
+  selected = null;
+  if (viewer) viewer.clearSelection();
+  $('#frag-list').querySelectorAll('.frag').forEach(e => e.classList.remove('on'));
+  hide('#body-bar');
+}
+
+/* Dragging the threshold re-runs the rule server-side. Debounced, because a
+   drag fires continuously and each pass reclassifies hundreds of bodies. */
+$('#ratio').oninput = (e) => {
+  ratio = Number(e.target.value);
+  $('#ratio-out').textContent = `${(ratio * 100).toFixed(1)}% — recalculating…`;
+  clearTimeout(reclassifyTimer);
+  reclassifyTimer = setTimeout(async () => {
+    try {
+      const r = await fetch(`/api/preview/${jobId}/classify?ratio=${ratio}`);
+      const data = await r.json();
+      if (!r.ok) throw new Error(data.detail || 'could not reclassify');
+      renderPreview(data.preview);
+      await loadGeometry();
+    } catch (err) {
+      $('#ratio-out').textContent = err.message;
+    }
+  }, 350);
+};
+
+$('#body-clear').onclick = clearSelection;
+$('#body-focus').onclick = () => viewer && viewer.focusSelection();
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape' && selected !== null) clearSelection();
+});
+
+$('#view-reset').onclick = () => { clearSelection(); viewer && viewer.resetView(); };
 $('#toggle-noise').onchange = (e) => viewer && viewer.setNoiseVisible(e.target.checked);
 $('#toggle-ghost').onchange = (e) => viewer && viewer.setPartOpacity(e.target.checked ? 0.25 : 1);
 $('#preview-cancel').onclick = () => location.reload();
@@ -132,7 +247,7 @@ $('#denoise').onclick = async () => {
   const btn = $('#denoise');
   btn.disabled = true; btn.textContent = 'Removing…';
   try {
-    const r = await fetch(`/api/preview/${jobId}/denoise`, {method: 'POST'});
+    const r = await fetch(`/api/preview/${jobId}/denoise?ratio=${ratio}`, {method: 'POST'});
     const data = await r.json();
     if (!r.ok) throw new Error(data.detail || 'denoise failed');
     renderPreview(data.preview);
@@ -149,7 +264,8 @@ $('#nest-now').onclick = async () => {
   const btn = $('#nest-now');
   btn.disabled = true; btn.textContent = 'Starting…';
   try {
-    const r = await fetch(`/api/preview/${jobId}/nest`, {method: 'POST'});
+    const q = pitch ? `?fine_pitch=${pitch}&coarse_pitch=${pitch * 2}` : '';
+    const r = await fetch(`/api/preview/${jobId}/nest${q}`, {method: 'POST'});
     const data = await r.json();
     if (!r.ok) throw new Error(data.detail || 'could not start the run');
     hide('#preview-panel'); show('#progress-panel');

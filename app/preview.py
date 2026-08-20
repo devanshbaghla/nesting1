@@ -6,36 +6,47 @@ your part is scanner noise or the pin that belongs to it, and once dropped it
 is gone from every number the run reports. So the file is classified, drawn,
 and left alone until someone looks at it.
 
-The rule, per spec
-------------------
-A fragment is noise when **both** hold:
+The rule
+--------
+A body is noise when it is small in **two** independent senses:
 
-1. it is **detached** from the object — its surface stands clear of it by more
-   than a touch tolerance; and
-2. its **largest** dimension is under ``ratio`` (25% by default) of the
-   **smallest** dimension of the object.
+1. its **largest** dimension is under ``ratio`` of the **smallest** dimension of
+   the object (2% by default); and
+2. it carries under ``area_share`` of the part's total surface area (0.01%).
 
-Size alone is not enough, and the drill shows why. It arrives as 23 shells,
-ten of which sit between 0.02 mm and 0.8 mm from the housing — a chuck, a
-trigger, screws, all modelled as their own shells and all touching the body
-they belong to. Anything abutting the object is part of the object however
-small it is, so the size test is only asked about pieces that stand apart. The
-genuine debris on that part sits 13 mm to 36 mm away.
+Distance does not enter into it. An earlier version required a fragment to stand
+clear of the object, on the reasoning that anything touching the part is part of
+the part. Real files argued the other way: a headlamp housing carries hundreds
+of shells a quarter of a millimetre across, flush against the body, and they are
+debris whatever they touch.
 
-Both dimensions are axis-aligned box measurements, and "the object" is the
-largest fragment rather than the whole file — measuring against the whole
-would let a speck 200 mm off the part inflate the very box it is being judged
-against, so the further away the debris, the less likely the rule would be to
-catch it.
+Why two tests and not one
+-------------------------
+A bounding box is a poor judge of importance. The dimension ratio alone, at 25%
+of the object's smallest dimension, works out at a 56 mm limit on a 400 mm
+housing -- and deleted 306 of its 351 bodies, a quarter of the mesh, including a
+socket carrying 6,512 mm2 of surface. Nothing about its box said it mattered.
 
-Comparing a fragment's longest axis against the object's shortest is
-deliberately strict in the safe direction: a sliver has to be small against
-the part's *thinnest* section before it is called debris, so a long thin thing
-that might be a real feature survives.
+Surface area does say so, and decisively: on that part the specks measure
+0.003 mm2 against the socket's 6,512 mm2, a factor of two million. So the area
+test is what protects structure, and it holds even when the ratio is set badly --
+which is the point, because one ratio cannot suit a 20 mm bracket and a 400 mm
+housing alike.
 
-Where the touch tolerance lands is a judgement, not a fact, so every fragment
-carries its measured gap into the report and the viewer prints it. A borderline
-call is then visible rather than silent.
+What is deliberately *not* used: whether a body is enclosed by the part. It
+sounds like the right question and cannot be answered here -- the housing is not
+watertight, so a flood fill of the outside leaks through the open surface into
+every cavity and reports every body as external.
+
+The object is the largest fragment rather than the whole file -- measuring
+against the whole would let a speck 200 mm off the part inflate the very box it
+is being judged against. Comparing a fragment's longest axis against the
+object's shortest is the strict direction, so a long thin thing that might be a
+real feature survives.
+
+``ratio`` is adjustable per request and the viewer exposes it; every fragment
+reports its size, area and distance so a borderline call is visible; and nothing
+is deleted until someone presses the button.
 
 This is a different question from the one :class:`~.core.mesh_repair.
 MeshDenoise` answers during a run, which compares bounding-box diagonals at a
@@ -50,20 +61,35 @@ from pathlib import Path
 
 import numpy as np
 import trimesh
-from scipy.spatial import cKDTree
 
-__all__ = ["NOISE_RATIO", "TOUCH_RATIO", "PREVIEW_FACE_BUDGET", "Fragment", "PreviewReport",
-           "classify", "geometry_payload", "drop_noise", "attached_set"]
+__all__ = ["NOISE_RATIO", "AREA_SHARE", "PREVIEW_FACE_BUDGET",
+           "SWEEP_MEMORY_BUDGET", "Fragment", "PreviewReport", "classify",
+           "components", "geometry_payload", "drop_noise", "sweep_cost",
+           "suggested_pitch"]
 
-#: a fragment is noise below this share of the object's smallest dimension
-NOISE_RATIO = 0.25
+#: a fragment is noise below this share of the object's smallest dimension.
+#: 2%, not 25%: the ratio is measured against the object's smallest dimension,
+#: which on a 400 mm housing is 225 mm — so 25% of it is a 56 mm limit, and a
+#: 56 mm limit deletes brackets and sockets along with the specks. At 2% the
+#: limit on that part is 4.5 mm and the largest thing it touches carries 13 mm²
+#: of surface, which is 0.003% of the part.
+NOISE_RATIO = 0.02
 
-#: a fragment closer than this share of the object's smallest dimension counts
-#: as touching it, and is kept whatever its size. 1% is loose enough to absorb
-#: the export tolerances that leave assembled shells a few hundredths apart,
-#: and tight enough that real debris — which is millimetres away, not
-#: hundredths — never qualifies.
-TOUCH_RATIO = 0.01
+#: ...and it must also carry less than this share of the part's total surface
+#: area. This is the guard that protects structure from the ratio being wrong.
+#: Debris is negligible in every sense at once: on the reference headlamp the
+#: specks measure 0.003 mm² while the smallest real feature the dimension rule
+#: caught measures 6,512 mm² — a factor of two million, so the two populations
+#: separate cleanly however the ratio is set.
+AREA_SHARE = 1e-4
+
+#: how much the FFT translation search may allocate for one correlation,
+#: in bytes. The search evaluates every lattice offset at once, so the array is
+#: `A.shape + B.shape - 1` per axis — about double each dimension, eight times
+#: the part's own voxel count. At the default 0.5 mm fine pitch a 294x340x423 mm
+#: headlamp needs 10.8 GB of it and the run dies on an allocation failure with
+#: nothing useful to say. 2 GB is a budget a workstation can actually meet.
+SWEEP_MEMORY_BUDGET = 2 * 1024 ** 3
 
 #: triangles sent to the browser before the part is decimated for drawing.
 #: A preview is a picture, not the geometry the engine uses; 300k triangles is
@@ -90,6 +116,10 @@ class Fragment:
     gap: float | None = None
     #: why it was kept or dropped, in the words the viewer shows
     reason: str = ""
+    #: surface area, and what share of the whole part that is. A box can be
+    #: small while the body inside it is real structure; area catches that.
+    area: float = 0.0
+    area_share: float = 0.0
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -106,15 +136,18 @@ class PreviewReport:
     object_extents: list = field(default_factory=list)
     object_smallest: float = 0.0
     threshold: float = 0.0           # absolute size below which a body is noise
-    touch_tolerance: float = 0.0     # closer than this counts as attached
     ratio: float = NOISE_RATIO
-    attached_kept: int = 0           # small, but spared for being attached
-    attached_bodies: int = 0         # bodies joined to the object at all
+    area_ratio: float = AREA_SHARE   # ...and below this share of the surface
+    area_limit: float = 0.0          # that share, in file units squared
+    total_area: float = 0.0
+    kept_for_area: int = 0           # small boxes spared for carrying surface
     fragments: list = field(default_factory=list)
     noise_bodies: int = 0
     noise_faces: int = 0
     watertight: bool = False
     decimated_to: int = 0            # 0 when the preview is the real geometry
+    suggested_pitch: float = 0.0     # finest lattice this part can afford
+    pitch_options: list = field(default_factory=list)
 
     @property
     def has_noise(self) -> bool:
@@ -123,19 +156,20 @@ class PreviewReport:
     def summary(self) -> str:
         if self.bodies <= 1:
             return "single body; no loose fragments to remove"
-        spared = ("" if not self.attached_kept else
-                  f" {self.attached_kept} small "
-                  f"{'body is' if self.attached_kept == 1 else 'bodies are'} "
-                  f"kept for touching the object.")
+        spared = ("" if not self.kept_for_area else
+                  f" {self.kept_for_area} small "
+                  f"{'body carries' if self.kept_for_area == 1 else 'bodies carry'}"
+                  f" too much surface to be debris and stays.")
         if not self.has_noise:
             return (f"{self.bodies} bodies, none of them noise — nothing is both "
-                    f"detached and under {self.threshold:.3f} across."
-                    + spared)
+                    f"under {self.threshold:.3f} across and under "
+                    f"{self.area_limit:.3g} of surface." + spared)
         return (f"{self.noise_bodies} of {self.bodies} bodies look like noise: "
-                f"detached from the object and under {self.threshold:.3f} "
-                f"across, {100 * self.ratio:.0f}% of its smallest dimension "
-                f"({self.object_smallest:.2f}). {self.noise_faces:,} of "
-                f"{self.faces:,} triangles." + spared)
+                f"under {self.threshold:.3f} across "
+                f"({100 * self.ratio:.1f}% of the object's smallest dimension, "
+                f"{self.object_smallest:.2f}) and under {self.area_limit:.3g} of "
+                f"surface. {self.noise_faces:,} of {self.faces:,} triangles "
+                f"({100 * self.noise_faces / max(self.faces, 1):.1f}%)." + spared)
 
     def to_dict(self) -> dict:
         d = asdict(self)
@@ -203,11 +237,12 @@ def _within(outer, inner) -> bool:
 
 
 def classify(mesh: trimesh.Trimesh, *, ratio: float = NOISE_RATIO,
-             touch: float | None = None,
+             area_share: float = AREA_SHARE,
              filename: str = "") -> tuple[list, PreviewReport]:
     """Return ``(components, report)`` — face groups, tagged noise or not."""
     report = PreviewReport(filename=filename, faces=int(len(mesh.faces)),
                            ratio=float(ratio),
+                           area_ratio=float(area_share),
                            extents=[float(v) for v in mesh.extents],
                            watertight=bool(mesh.is_watertight))
 
@@ -217,8 +252,6 @@ def classify(mesh: trimesh.Trimesh, *, ratio: float = NOISE_RATIO,
         report.object_extents = [float(v) for v in mesh.extents]
         report.object_smallest = float(np.min(mesh.extents))
         report.threshold = report.object_smallest * ratio
-        report.touch_tolerance = report.object_smallest * (
-            TOUCH_RATIO if touch is None else touch)
         report.fragments = [Fragment(
             index=0, faces=int(len(mesh.faces)),
             extents=[float(v) for v in mesh.extents],
@@ -226,7 +259,6 @@ def classify(mesh: trimesh.Trimesh, *, ratio: float = NOISE_RATIO,
             centre=[float(v) for v in mesh.bounds.mean(axis=0)],
             is_noise=False, share=None, gap=0.0,
             reason="the object").to_dict()]
-        report.attached_bodies = 1
         return comps or [np.arange(len(mesh.faces))], report
 
     boxes = [_box(mesh, c) for c in comps]
@@ -237,49 +269,45 @@ def classify(mesh: trimesh.Trimesh, *, ratio: float = NOISE_RATIO,
     report.object_extents = [float(v) for v in boxes[obj_i][0]]
     report.object_smallest = smallest
     report.threshold = smallest * ratio
-    report.touch_tolerance = smallest * (TOUCH_RATIO if touch is None else touch)
 
-    # Distances are only needed for fragments small enough to be at risk, so
-    # the tree over the object's surface is built only if one exists — on a
-    # million-face part that is seconds saved on the common clean file.
-    at_risk = [i for i, (e, _) in enumerate(boxes)
-               if i != obj_i and float(np.max(e)) < report.threshold]
-    gaps = _gaps_to(boxes, obj_i, at_risk)
+    # surface area per body, from one pass over the whole mesh
+    face_area = mesh.area_faces
+    total_area = float(face_area.sum()) or 1.0
+    areas = [float(face_area[c].sum()) for c in comps]
+    report.total_area = total_area
+    report.area_limit = total_area * area_share
 
-    # Anything too big to be noise is part of the object by definition, so the
-    # attached set grows out from all of them at once, not just the largest.
-    seeds = [i for i in range(len(comps)) if i not in set(at_risk)]
-    attached = attached_set(boxes, seeds, report.touch_tolerance) if at_risk \
-        else set(range(len(comps)))
-    report.attached_bodies = len(attached)
+    small = {i for i, (e, _) in enumerate(boxes)
+             if i != obj_i and float(np.max(e)) < report.threshold}
+    # distance is reported, never used to decide: it is the context a person
+    # needs to spot a call the ratio got wrong, not part of the test
+    gaps = _gaps_to(boxes, obj_i, sorted(small))
 
     for i, (comp, (extents, centre)) in enumerate(zip(comps, boxes)):
         largest = float(np.max(extents))
+        area = areas[i]
+        share_of_area = area / total_area
+        is_small = i in small
+        # a body carrying real surface is structure, whatever its box measures
+        negligible = share_of_area < area_share
+        noise = bool(is_small and negligible)
         gap = 0.0 if i == obj_i else gaps.get(i)
-        small = i != obj_i and largest < report.threshold
-        detached = i not in attached
-        noise = bool(small and detached)
 
         if i == obj_i:
             reason = "the object"
-        elif not small:
-            reason = f"too big to be noise ({largest:.3g} across)"
-        elif not detached:
-            # three ways to be attached, and they read differently to a person
-            # deciding whether the list is trustworthy
-            if _within(boxes[obj_i], (extents, centre)):
-                reason = "enclosed by the object, kept"
-            elif gap is not None and gap <= report.touch_tolerance:
-                reason = f"touching the object ({gap:.3g} away), kept"
-            else:
-                reason = ("joined to the object through other bodies, kept"
-                          if gap is None else
-                          f"joined through other bodies ({gap:.3g} from the "
-                          f"main shell), kept")
-            report.attached_kept += 1
+        elif not is_small:
+            reason = (f"kept: {largest:.3g} across, over the "
+                      f"{report.threshold:.3g} limit")
+        elif not negligible:
+            reason = (f"kept: {largest:.3g} across but carries {area:.3g} of "
+                      f"surface ({100 * share_of_area:.3f}% of the part)")
         else:
-            reason = (f"free-standing, {gap:.3g} from the main shell and only "
-                      f"{largest:.3g} across")
+            where = ("inside the object"
+                     if _within(boxes[obj_i], (extents, centre))
+                     else f"{gap:.3g} from the main shell"
+                     if gap else "against the main shell")
+            reason = (f"only {largest:.3g} across and {area:.3g} of surface "
+                      f"({where})")
 
         report.fragments.append(Fragment(
             index=i, faces=int(len(comp)),
@@ -288,54 +316,14 @@ def classify(mesh: trimesh.Trimesh, *, ratio: float = NOISE_RATIO,
             centre=[float(v) for v in centre],
             is_noise=noise,
             share=(largest / smallest) if smallest > 0 else None,
-            gap=gap, reason=reason,
+            gap=gap, reason=reason, area=area, area_share=share_of_area,
         ).to_dict())
         if noise:
             report.noise_bodies += 1
             report.noise_faces += int(len(comp))
+        elif is_small:
+            report.kept_for_area += 1
     return comps, report
-
-
-def _touching(boxes, i: int, j: int, tol: float) -> bool:
-    """Are two boxes within ``tol`` of each other?"""
-    (ei, ci), (ej, cj) = boxes[i], boxes[j]
-    clear = np.abs(np.asarray(ci) - np.asarray(cj)) - (np.asarray(ei)
-                                                       + np.asarray(ej)) / 2.0
-    return bool(np.linalg.norm(np.maximum(clear, 0.0)) <= tol)
-
-
-def attached_set(boxes, seeds, tol: float) -> set:
-    """Everything reachable from ``seeds`` by hops between touching bodies.
-
-    Attachment has to be transitive or the rule punishes assemblies. A clip
-    welded to a bracket welded to the housing is attached to the part, even
-    though its own box is nowhere near the housing's — measuring only against
-    the largest shell would call it debris and offer to delete it. On the
-    reference headlamp that is the whole difference: 46 bodies flagged when
-    attachment is measured to the largest shell alone, and none at all once it
-    is followed through the assembly.
-
-    Candidate neighbours come from a tree over box centres. Two boxes can only
-    be within ``tol`` if their centres are within half their diagonals plus
-    ``tol``, so a radius built from the largest box never misses a pair; the
-    exact box test then decides.
-    """
-    extents = np.array([e for e, _ in boxes], float)
-    centres = np.array([c for _, c in boxes], float)
-    if not len(centres):
-        return set(seeds)
-    half_diag = np.linalg.norm(extents, axis=1) / 2.0
-    reach = float(half_diag.max()) + tol * np.sqrt(3.0)
-
-    tree = cKDTree(centres)
-    reached, frontier = set(seeds), list(seeds)
-    while frontier:
-        i = frontier.pop()
-        for j in tree.query_ball_point(centres[i], half_diag[i] + reach):
-            if j not in reached and _touching(boxes, i, j, tol):
-                reached.add(j)
-                frontier.append(j)
-    return reached
 
 
 def _gaps_to(boxes, obj_i: int, wanted) -> dict:
@@ -428,7 +416,7 @@ def geometry_payload(mesh: trimesh.Trimesh, comps, report: PreviewReport,
 
 
 def drop_noise(mesh: trimesh.Trimesh, *, ratio: float = NOISE_RATIO,
-               touch: float | None = None):
+               area_share: float = AREA_SHARE):
     """Return ``(mesh without its noise, report)``.
 
     Removal is a face mask on the original, so every surviving triangle is the
@@ -436,7 +424,7 @@ def drop_noise(mesh: trimesh.Trimesh, *, ratio: float = NOISE_RATIO,
     through. The report describes the file as it was, fragments still tagged,
     so the caller can say what went rather than only that something did.
     """
-    comps, report = classify(mesh, ratio=ratio, touch=touch)
+    comps, report = classify(mesh, ratio=ratio, area_share=area_share)
     noisy = {f["index"] for f in report.fragments if f["is_noise"]}
     if not noisy:
         return mesh, report
@@ -447,3 +435,50 @@ def drop_noise(mesh: trimesh.Trimesh, *, ratio: float = NOISE_RATIO,
     out.update_faces(mask)
     out.remove_unreferenced_vertices()
     return out, report
+
+
+# --------------------------------------------------------------------------- #
+#  What the translation search will cost at a given lattice
+# --------------------------------------------------------------------------- #
+def sweep_cost(extents, pitch: float, clearance: float = 5.0) -> dict:
+    """Size of one FFT correlation for a part of these extents at ``pitch``.
+
+    Predicting this matters because the failure mode is otherwise a bare
+    ``MemoryError`` from numpy, surfaced to the user as "could not process this
+    file" with no hint that the lattice is the problem.
+
+    The estimate is the output array only. ``fftconvolve`` also holds float32
+    copies of both operands and their complex spectra, so real peak use is a
+    few times this — which is why the budget it is compared against is well
+    under physical memory.
+    """
+    extents = np.asarray(extents, float)
+    pitch = float(pitch)
+    if pitch <= 0:
+        raise ValueError("pitch must be positive")
+    # ClearanceGrid pads A by the dilation radius; B is the bare rotated copy
+    radius = clearance + 1.5 * pitch
+    pad = int(np.ceil(radius / pitch)) + 2
+    a = np.ceil(extents / pitch) + 2 + 2 * pad
+    b = np.ceil(extents / pitch) + 2
+    shape = (a + b - 1).astype(np.int64)
+    elements = float(np.prod(shape.astype(float)))
+    return {"pitch": pitch,
+            "shape": [int(v) for v in shape],
+            "elements": elements,
+            "bytes": elements * 4.0,
+            "within_budget": elements * 4.0 <= SWEEP_MEMORY_BUDGET}
+
+
+def suggested_pitch(extents, clearance: float = 5.0,
+                    budget: int = SWEEP_MEMORY_BUDGET) -> float:
+    """The finest lattice whose correlation still fits ``budget``.
+
+    Rounded up to a readable step so the number offered to a user is 1.5 rather
+    than 1.4372, and floored at the engine's own default — there is no reason to
+    coarsen a small part just because the estimate says it could afford to.
+    """
+    for pitch in (0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 16.0):
+        if sweep_cost(extents, pitch, clearance)["within_budget"]:
+            return pitch
+    return 24.0

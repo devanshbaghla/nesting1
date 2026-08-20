@@ -9,6 +9,8 @@ Routes
 GET  /                                       upload page + results UI
 POST /api/preview                            upload an STL, inspect it, nest nothing
 GET  /api/preview/{id}/geometry              triangles, split into part and noise
+GET  /api/preview/{id}/classify              re-run the rule at another ratio
+GET  /api/preview/{id}/body/{i}              one body's triangles, for highlighting
 POST /api/preview/{id}/denoise               drop the noise fragments
 POST /api/preview/{id}/nest                  accept the part and queue the run
 POST /api/jobs                               upload an STL, returns a job id
@@ -31,6 +33,7 @@ import shutil
 import zipfile
 from pathlib import Path
 
+import numpy as np
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import (FileResponse, HTMLResponse, JSONResponse,
                                StreamingResponse)
@@ -189,21 +192,101 @@ async def create_preview(
         raise HTTPException(422, "no triangles found in the file")
 
     _, report = preview.classify(mesh, filename=name)
+    _advise_pitch(report, mesh, params["clearance"])
     job.audit = {"preview": report.to_dict()}
     return {"job_id": job.id, "preview": report.to_dict()}
 
 
+#: analysed meshes, keyed by job. Splitting a 1.4M-face part takes over a
+#: second, and the viewer asks again for every body the user clicks; the file's
+#: mtime is the key's second half so denoising invalidates it for free.
+_ANALYSED: dict[str, tuple] = {}
+
+
+def _analysed(job, ratio: float | None = None):
+    """``(mesh, components, report)`` for a job, re-used across requests.
+
+    The key carries the ratio as well as the file's mtime, so dragging the
+    threshold re-classifies without re-reading a 71 MB STL from disk.
+    """
+    path = _source_stl(job)
+    ratio = preview.NOISE_RATIO if ratio is None else float(ratio)
+    stamp = (path.stat().st_mtime_ns, round(ratio, 6))
+    hit = _ANALYSED.get(job.id)
+    if hit and hit[0] == stamp:
+        return hit[1:]
+    mesh = hit[1] if hit and hit[0][0] == stamp[0] else preview.load_mesh(path)
+    comps, report = preview.classify(mesh, ratio=ratio, filename=job.filename)
+    _ANALYSED[job.id] = (stamp, mesh, comps, report)
+    return mesh, comps, report
+
+
+def _ratio(value: float) -> float:
+    if not 0.0 < value < 1.0:
+        raise HTTPException(400, "ratio must be between 0 and 1 (exclusive)")
+    return float(value)
+
+
+
+def _advise_pitch(report, mesh, clearance: float) -> None:
+    """Attach what each candidate lattice would cost the translation search.
+
+    The sweep allocates one array per orientation sized by the part and the
+    pitch, and on a large part at the default 0.5 mm that is 10.8 GB — which
+    numpy reports as a bare allocation failure with nothing to act on. Costing
+    the options here means the choice is made with the numbers in view.
+    """
+    report.suggested_pitch = preview.suggested_pitch(mesh.extents, clearance)
+    report.pitch_options = [
+        preview.sweep_cost(mesh.extents, p, clearance)
+        for p in (0.25, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)]
+
+
 @app.get("/api/preview/{job_id}/geometry")
-def preview_geometry(job_id: str):
+def preview_geometry(job_id: str, ratio: float = preview.NOISE_RATIO):
     """Triangles for the viewer, split into the part and each noise fragment."""
     job = _job(job_id)
-    mesh = preview.load_mesh(_source_stl(job))
-    comps, report = preview.classify(mesh, filename=job.filename)
+    mesh, comps, report = _analysed(job, _ratio(ratio))
     return JSONResponse(preview.geometry_payload(mesh, comps, report))
 
 
+@app.get("/api/preview/{job_id}/classify")
+def preview_reclassify(job_id: str, ratio: float = preview.NOISE_RATIO):
+    """Re-run the rule at a different threshold, without redrawing anything."""
+    job = _job(job_id)
+    _, _, report = _analysed(job, _ratio(ratio))
+    job.audit = {**job.audit, "preview": report.to_dict()}
+    return {"job_id": job.id, "preview": report.to_dict()}
+
+
+@app.get("/api/preview/{job_id}/body/{index}")
+def preview_body(job_id: str, index: int,
+                 ratio: float = preview.NOISE_RATIO):
+    """One body's triangles, at full resolution, for highlighting it.
+
+    Fetched on demand rather than shipped with the rest: a part can have
+    hundreds of bodies and the viewer only ever highlights one at a time. Not
+    decimated either — the whole point of clicking a 0.4 mm fragment is to see
+    its actual shape.
+    """
+    job = _job(job_id)
+    mesh, comps, report = _analysed(job, _ratio(ratio))
+    if not 0 <= index < len(comps):
+        raise HTTPException(404, f"no body {index}; this part has {len(comps)}")
+    faces = comps[index]
+    tris = np.asarray(mesh.triangles[faces], dtype=np.float32)
+    lo, hi = tris.reshape(-1, 3).min(axis=0), tris.reshape(-1, 3).max(axis=0)
+    return JSONResponse({
+        "index": index,
+        "positions": tris.reshape(-1).tolist(),
+        "bounds": [[float(v) for v in lo], [float(v) for v in hi]],
+        "fragment": report.fragments[index],
+    })
+
+
 @app.post("/api/preview/{job_id}/denoise")
-def preview_denoise(job_id: str):
+def preview_denoise(job_id: str,
+                    ratio: float = preview.NOISE_RATIO):
     """Drop the fragments the rule called noise, and rewrite the upload.
 
     Destructive by intent — this is the button that says yes. The file the run
@@ -212,13 +295,15 @@ def preview_denoise(job_id: str):
     job = _job(job_id)
     path = _source_stl(job)
     mesh = preview.load_mesh(path)
-    cleaned, report = preview.drop_noise(mesh)
+    cleaned, report = preview.drop_noise(mesh, ratio=_ratio(ratio))
     if not report.has_noise:
         return {"job_id": job.id, "removed": 0,
                 "preview": report.to_dict(), "note": "nothing matched the rule"}
 
     cleaned.export(str(path))
-    _, after = preview.classify(preview.load_mesh(path), filename=job.filename)
+    _ANALYSED.pop(job.id, None)
+    _, after = preview.classify(preview.load_mesh(path), ratio=_ratio(ratio),
+                                filename=job.filename)
     job.audit = {"preview": after.to_dict(), "denoised_from": report.to_dict()}
     job.log.append(f"removed {report.noise_bodies} noise "
                    f"{'fragment' if report.noise_bodies == 1 else 'fragments'} "
@@ -228,11 +313,20 @@ def preview_denoise(job_id: str):
 
 
 @app.post("/api/preview/{job_id}/nest")
-def preview_nest(job_id: str):
-    """Accept the part as previewed and queue the run."""
+def preview_nest(job_id: str, coarse_pitch: float | None = None,
+                 fine_pitch: float | None = None):
+    """Accept the part as previewed and queue the run.
+
+    The lattice is settled here rather than at upload because this is the
+    first point where the part's size is known, and size is what decides
+    whether a pitch is affordable. A pitch that cannot fit is refused now,
+    with the number, instead of failing minutes later inside the sweep.
+    """
     job = _job(job_id)
     if job.status != "preview":
         raise HTTPException(409, f"job is already {job.status}")
+    pitches = _checked_pitches(job, coarse_pitch, fine_pitch)
+    job.params.update(pitches)
     try:
         stats = validate_upload(_source_stl(job))
     except ValueError as exc:
@@ -240,8 +334,40 @@ def preview_nest(job_id: str):
     job.audit = {**job.audit, **stats}
     _note_intake(job, stats)
     job.status, job.stage = "queued", "queued"
+    if pitches.get("coarse_pitch") or pitches.get("fine_pitch"):
+        job.log.append(
+            f"voxel pitch set to coarse {pitches['coarse_pitch']} / "
+            f"fine {pitches['fine_pitch']} (file units)")
     store.submit(job)
-    return {"job_id": job.id, "status": job.status, "mesh": stats}
+    return {"job_id": job.id, "status": job.status, "mesh": stats,
+            "pitch": pitches}
+
+
+def _checked_pitches(job, coarse: float | None, fine: float | None) -> dict:
+    """Validate a requested lattice against what the sweep can allocate."""
+    if coarse is None and fine is None:
+        return {}
+    mesh = preview.load_mesh(_source_stl(job))
+    clearance = float(job.params["clearance"])
+    coarse = float(coarse if coarse else fine * 2)
+    fine = float(fine if fine else coarse / 2)
+    if not 0 < fine <= coarse:
+        raise HTTPException(
+            400, "fine pitch must be positive and no larger than the coarse "
+                 f"pitch (got fine {fine}, coarse {coarse})")
+    for label, pitch in (("coarse", coarse), ("fine", fine)):
+        cost = preview.sweep_cost(mesh.extents, pitch, clearance)
+        if not cost["within_budget"]:
+            suggest = preview.suggested_pitch(mesh.extents, clearance)
+            raise HTTPException(
+                400,
+                f"a {label} pitch of {pitch} needs "
+                f"{cost['bytes'] / 2 ** 30:.1f} GB for one translation "
+                f"search on this part ({cost['shape'][0]} x "
+                f"{cost['shape'][1]} x {cost['shape'][2]} voxels), over the "
+                f"{preview.SWEEP_MEMORY_BUDGET / 2 ** 30:.0f} GB budget. "
+                f"Try {suggest} or coarser.")
+    return {"coarse_pitch": coarse, "fine_pitch": fine}
 
 
 def _source_stl(job) -> Path:

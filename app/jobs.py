@@ -108,6 +108,8 @@ class JobStore:
                 objective=job.params["objective"],
                 refiner=job.params.get("refiner"),
                 distance_backend=job.params.get("distance_backend"),
+                coarse_pitch=job.params.get("coarse_pitch"),
+                fine_pitch=job.params.get("fine_pitch"),
                 top_n=job.params["top_n"],
                 verbose=False,
             )

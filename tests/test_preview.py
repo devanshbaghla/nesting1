@@ -1,18 +1,38 @@
 """The pre-nesting inspection: what gets called noise, and what must not.
 
-The rule has two halves and the interesting tests are the ones that check the
-halves are actually independent — that a tiny fragment welded to the part
-survives, and that a distant one only dies if it is also small. Getting either
-wrong deletes real geometry, and the deletion is applied to the file the run
-will read, so there is no second chance.
+The rule is size only — a fragment goes if its largest dimension is under a
+share of the object's smallest. Distance was tried as a second condition and
+removed: a headlamp carries hundreds of quarter-millimetre shells flush against
+the body, and they are debris whatever they touch.
+
+So the tests that matter are the ones pinning what the threshold is measured
+against, and that removal takes exactly the flagged faces and nothing else. The
+deletion is applied to the file the run will read, so there is no second chance.
 """
+import pathlib
+
 import numpy as np
 import trimesh
 
-from app.preview import (NOISE_RATIO, TOUCH_RATIO, attached_set, classify,
-                         components, drop_noise, geometry_payload)
+import app.preview as _pv
+from app.preview import (AREA_SHARE, NOISE_RATIO, SWEEP_MEMORY_BUDGET,
+                         components, geometry_payload, suggested_pitch,
+                         sweep_cost)
 
-OBJ = (40.0, 60.0, 100.0)          # smallest dimension 40 -> noise under 10
+OBJ = (40.0, 60.0, 100.0)
+
+#: Tests pin the rule, not the shipped defaults, so they state both
+#: thresholds. At this ratio the size limit is 10 mm on the fixture object,
+#: and the area limit is loose enough that the dimension test is what decides.
+RATIO, AREA = 0.25, 0.01
+
+
+def classify(mesh, *, ratio=RATIO, area_share=AREA, **kw):
+    return _pv.classify(mesh, ratio=ratio, area_share=area_share, **kw)
+
+
+def drop_noise(mesh, *, ratio=RATIO, area_share=AREA):
+    return _pv.drop_noise(mesh, ratio=ratio, area_share=area_share)
 
 
 def _obj():
@@ -37,44 +57,86 @@ def test_a_small_detached_fragment_is_noise():
     assert r.bodies == 2
     assert r.noise_bodies == 1
     assert np.isclose(r.object_smallest, 40.0)
-    assert np.isclose(r.threshold, 40.0 * NOISE_RATIO)
+    assert np.isclose(r.threshold, 40.0 * RATIO)
 
 
-def test_a_big_detached_fragment_is_not_noise():
-    """Distance alone must not condemn anything."""
-    _, r = classify(_scene(_obj(), _speck(size=30.0)))
+def test_a_big_fragment_is_not_noise_however_far_away():
+    """Only size decides, so distance cannot condemn a large fragment."""
+    _, r = classify(_scene(_obj(), _speck(size=30.0, at=(900.0, 0, 0))))
     assert r.noise_bodies == 0
-    assert "too big" in r.fragments[1]["reason"]
+    assert "over the" in r.fragments[1]["reason"]
 
 
-def test_a_small_touching_fragment_is_kept():
-    """The refinement that matters: attached geometry is part of the part.
+def test_a_small_touching_fragment_is_still_noise():
+    """Touching the part does not save a speck; this is the point of the change.
 
-    A 2 mm nub on the face of the box is well under the size threshold, and
-    would be deleted by size alone. It is welded to the object, so it stays.
+    A 2 mm nub welded to the face of the box is debris by size, and size is the
+    only test. An earlier version spared it for being attached, which left the
+    sub-millimetre shells on a real headlamp in place.
     """
     nub = _speck(size=2.0, at=(0.0, 0.0, OBJ[2] / 2))     # sitting on the top face
     _, r = classify(_scene(_obj(), nub))
     assert r.bodies == 2
-    assert r.noise_bodies == 0, r.fragments[1]["reason"]
-    assert r.attached_kept == 1
-    assert "touching" in r.fragments[1]["reason"]
+    assert r.noise_bodies == 1, r.fragments[1]["reason"]
 
 
-def test_the_gap_decides_between_two_identical_specks():
-    """Same size, different distance — only the far one goes."""
+def test_distance_does_not_change_the_verdict():
+    """Two identical specks, one welded on and one far off — both go."""
     near = _speck(size=2.0, at=(0.0, 0.0, OBJ[2] / 2))
     far = _speck(size=2.0, at=(300.0, 0.0, 0.0))
     _, r = classify(_scene(_obj(), near, far))
-    flagged = [f for f in r.fragments if f["is_noise"]]
-    assert len(flagged) == 1
-    assert flagged[0]["gap"] > r.touch_tolerance
-    assert r.attached_kept == 1
+    assert r.noise_bodies == 2, [f["reason"] for f in r.fragments]
 
 
-def test_touch_tolerance_scales_with_the_object():
+def test_the_ratio_moves_the_threshold():
+    """One ratio cannot suit a 20 mm bracket and a 400 mm housing alike."""
+    scene = _scene(_obj(), _speck(size=6.0))              # 6 mm on a 40 mm min
+    assert classify(scene, ratio=0.25)[1].noise_bodies == 1     # limit 10
+    assert classify(scene, ratio=0.10)[1].noise_bodies == 0     # limit 4
+    assert classify(scene, ratio=0.02)[1].threshold == 40.0 * 0.02
+
+
+def test_a_small_body_carrying_real_surface_is_kept():
+    """The guard that stopped a 6,512 mm2 socket being called debris.
+
+    Its box is small against the object, so the dimension test condemns it. Its
+    surface is a real share of the part, so the area test saves it -- and that
+    is the test that survives the ratio being set wrongly.
+    """
+    scene = _scene(_obj(), _speck(size=6.0))
+    _, r = classify(scene, ratio=0.25, area_share=1e-6)
+    assert r.noise_bodies == 0
+    assert r.kept_for_area == 1
+    assert "carries" in r.fragments[1]["reason"]
+
+
+def test_both_tests_must_agree_before_anything_is_removed():
+    scene = _scene(_obj(), _speck(size=6.0))
+    assert classify(scene, ratio=0.25, area_share=0.01)[1].noise_bodies == 1
+    assert classify(scene, ratio=0.25, area_share=1e-9)[1].noise_bodies == 0
+    assert classify(scene, ratio=0.001, area_share=0.01)[1].noise_bodies == 0
+
+
+def test_area_is_reported_per_body():
     _, r = classify(_scene(_obj(), _speck()))
-    assert np.isclose(r.touch_tolerance, 40.0 * TOUCH_RATIO)
+    for f in r.fragments:
+        assert f["area"] > 0
+        assert 0 < f["area_share"] <= 1
+    assert r.total_area > 0 and r.area_limit > 0
+
+
+def test_the_shipped_defaults_are_conservative():
+    """2%, not 25%: the 25% limit deleted a quarter of a real headlamp."""
+    assert NOISE_RATIO == 0.02
+    assert AREA_SHARE == 1e-4
+
+
+def test_the_gap_is_reported_but_unused():
+    """Distance is context for the reader, not an input to the test."""
+    _, r = classify(_scene(_obj(), _speck(at=(300.0, 0, 0))))
+    flagged = [f for f in r.fragments if f["is_noise"]][0]
+    assert flagged["gap"] > 0
+    assert "from the main shell" in flagged["reason"]
 
 
 def test_the_object_itself_is_never_noise():
@@ -135,11 +197,12 @@ def test_drop_noise_is_a_no_op_when_there_is_none():
     assert out is mesh and not r.has_noise
 
 
-def test_removal_keeps_a_touching_nub():
+def test_removal_takes_a_touching_nub_too():
     nub = _speck(size=2.0, at=(0.0, 0.0, OBJ[2] / 2))
     mesh = _scene(_obj(), nub)
     out, r = drop_noise(mesh)
-    assert len(out.faces) == len(mesh.faces), "a welded nub must survive"
+    assert len(out.faces) == len(mesh.faces) - r.noise_faces
+    assert np.allclose(sorted(out.extents), sorted(OBJ))
 
 
 # --------------------------------------------------------------------------- #
@@ -249,54 +312,126 @@ def test_a_small_mesh_is_sent_whole():
 
 
 # --------------------------------------------------------------------------- #
-#  attachment is transitive
+#  what a lattice will cost the translation search
 # --------------------------------------------------------------------------- #
-def test_a_speck_attached_through_a_chain_is_kept():
-    """A clip on a bracket on the housing is attached to the part.
+def test_sweep_cost_grows_as_the_cube_of_resolution():
+    """Halving the pitch is eight times the memory, which is the whole trap.
 
-    The speck's own box is nowhere near the object's, so measuring attachment
-    against the largest shell alone condemns it. On the reference headlamp that
-    single change is the difference between 46 bodies offered for deletion and
-    none: every one of the 46 was joined to the part through other bodies.
+    Measured on a part big enough for the law to show: the grid also carries an
+    additive pad for the clearance dilation, and on a 40 mm fixture that pad
+    dominates and the ratio comes out at 6.6 rather than 8.
     """
-    bridge = trimesh.creation.box(extents=(30.0, 4.0, 4.0))
-    bridge.apply_translation((OBJ[0] / 2 + 15.0, 0.0, 0.0))   # touches the box
-    tip = _speck(size=2.0, at=(OBJ[0] / 2 + 31.0, 0.0, 0.0))  # touches the bridge
-    _, r = classify(_scene(_obj(), bridge, tip))
-
-    assert r.bodies == 3
-    assert r.noise_bodies == 0, [f["reason"] for f in r.fragments]
-    assert r.attached_bodies == 3
-    assert any("through other bodies" in f["reason"] for f in r.fragments)
+    big = [294.01, 340.07, 423.09]
+    coarse = sweep_cost(big, 1.0)
+    fine = sweep_cost(big, 0.5)
+    assert 7.0 < fine["elements"] / coarse["elements"] < 9.0
 
 
-def test_a_chain_that_does_not_reach_still_leaves_noise():
-    """Transitivity must not become 'keep everything'."""
-    bridge = trimesh.creation.box(extents=(30.0, 4.0, 4.0))
-    bridge.apply_translation((OBJ[0] / 2 + 15.0, 0.0, 0.0))
-    stray = _speck(size=2.0, at=(400.0, 0.0, 0.0))            # touches nothing
-    _, r = classify(_scene(_obj(), bridge, stray))
-    assert r.noise_bodies == 1
-    flagged = [f for f in r.fragments if f["is_noise"]][0]
-    assert "free-standing" in flagged["reason"]
+def test_padding_dominates_on_a_small_part():
+    """...and the estimate must stay honest there, not just asymptotically."""
+    ratio = sweep_cost(OBJ, 1.0)["elements"] / sweep_cost(OBJ, 2.0)["elements"]
+    assert 5.0 < ratio < 8.0, ratio
 
 
-def test_attached_set_walks_the_whole_chain():
-    boxes = [(np.array([10.0, 10, 10]), np.array([0.0, 0, 0])),
-             (np.array([10.0, 10, 10]), np.array([10.0, 0, 0])),
-             (np.array([10.0, 10, 10]), np.array([20.0, 0, 0])),
-             (np.array([10.0, 10, 10]), np.array([500.0, 0, 0]))]
-    reached = attached_set(boxes, [0], tol=0.01)
-    assert reached == {0, 1, 2}, reached
+def test_a_large_part_at_a_fine_pitch_is_over_budget():
+    """The headlamp that failed: 294 x 340 x 423 mm at 0.5 mm wants 10.8 GB."""
+    cost = sweep_cost([294.01, 340.07, 423.09], 0.5)
+    assert not cost["within_budget"]
+    assert 10.0 < cost["bytes"] / 2 ** 30 < 12.0
+    assert cost["shape"] == [1209, 1393, 1725]
 
 
-def test_attachment_seeds_from_every_big_body_not_just_the_largest():
-    """A speck touching a second large body is attached to the part."""
-    other = trimesh.creation.box(extents=(30.0, 30.0, 30.0))
-    other.apply_translation((300.0, 0.0, 0.0))
-    tip = _speck(size=2.0, at=(300.0, 0.0, 16.0))             # sits on `other`
-    _, r = classify(_scene(_obj(), other, tip))
-    assert r.noise_bodies == 0, [f["reason"] for f in r.fragments]
+def test_a_small_part_at_a_fine_pitch_is_fine():
+    assert sweep_cost([28.0, 35.0, 123.0], 0.5)["within_budget"]
+
+
+def test_the_suggestion_always_fits():
+    for ext in ([294.01, 340.07, 423.09], [899.0, 208.4, 187.9],
+                [28.0, 35.0, 123.0], [2000.0, 2000.0, 2000.0]):
+        pitch = suggested_pitch(ext)
+        assert sweep_cost(ext, pitch)["within_budget"], (ext, pitch)
+
+
+def test_the_suggestion_is_not_needlessly_coarse():
+    """One step finer should be over budget, unless already at the finest step."""
+    for ext in ([294.01, 340.07, 423.09], [899.0, 208.4, 187.9]):
+        pitch = suggested_pitch(ext)
+        assert sweep_cost(ext, pitch / 2)["bytes"] > SWEEP_MEMORY_BUDGET, ext
+
+
+def test_a_non_positive_pitch_is_refused():
+    for bad in (0.0, -1.0):
+        try:
+            sweep_cost(OBJ, bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("a non-positive pitch must be refused")
+
+
+# --------------------------------------------------------------------------- #
+#  the per-body endpoint the viewer clicks
+# --------------------------------------------------------------------------- #
+def _client_with(mesh):
+    """A preview job holding `mesh`, and its id.
+
+    These go through the real endpoints, so they exercise the *shipped*
+    defaults rather than the loose thresholds the unit tests pin. A 0.5 mm
+    speck is debris by those defaults; a 2 mm one is not.
+    """
+    import tempfile, warnings
+    warnings.filterwarnings("ignore")
+    from fastapi.testclient import TestClient
+    from app.main import app
+
+    path = pathlib.Path(tempfile.mkdtemp()) / "part.stl"
+    mesh.export(str(path))
+    client = TestClient(app)
+    with open(path, "rb") as fh:
+        r = client.post("/api/preview",
+                        files={"file": ("part.stl", fh, "application/octet-stream")},
+                        data={"profile": "quick"})
+    assert r.status_code == 200, r.text
+    return client, r.json()["job_id"], r.json()["preview"]
+
+
+def test_each_body_can_be_fetched_on_its_own():
+    client, job, rep = _client_with(_scene(_obj(), _speck(size=0.5)))
+    for frag in rep["fragments"]:
+        r = client.get(f"/api/preview/{job}/body/{frag['index']}")
+        assert r.status_code == 200
+        body = r.json()
+        assert len(body["positions"]) // 9 == frag["faces"]
+        assert body["fragment"]["reason"] == frag["reason"]
+        assert len(body["bounds"]) == 2
+
+
+def test_a_body_is_sent_at_full_resolution():
+    """Clicking a fragment is how you see its shape; it must not be decimated."""
+    client, job, rep = _client_with(_scene(_obj(), _speck(size=0.5)))
+    noise = [f for f in rep["fragments"] if f["is_noise"]][0]
+    body = client.get(f"/api/preview/{job}/body/{noise['index']}").json()
+    assert len(body["positions"]) // 9 == noise["faces"]
+
+
+def test_an_unknown_body_is_a_clean_404():
+    client, job, rep = _client_with(_scene(_obj(), _speck(size=0.5)))
+    r = client.get(f"/api/preview/{job}/body/999")
+    assert r.status_code == 404
+    assert "999" in r.json()["detail"]
+
+
+def test_body_indices_follow_the_file_after_denoise():
+    """The analysis is cached; denoising has to invalidate it."""
+    client, job, rep = _client_with(_scene(_obj(), _speck(size=0.5)))
+    assert rep["bodies"] == 2
+    before = client.get(f"/api/preview/{job}/body/1").json()
+    assert before["positions"]
+
+    client.post(f"/api/preview/{job}/denoise")
+    after = client.get(f"/api/preview/{job}/geometry").json()
+    assert after["noise"] == []
+    assert client.get(f"/api/preview/{job}/body/1").status_code == 404
 
 
 if __name__ == "__main__":

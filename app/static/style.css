@@ -115,3 +115,43 @@ padding:5px 8px;border-radius:6px;background:#0d0f14;color:var(--dim)}
 .preview-actions .btn{flex:1;text-align:center}
 .btn.danger{background:var(--noise);color:#2a0709}
 .btn:disabled{opacity:.45;cursor:not-allowed}
+
+/* ---------- inspecting one body ---------- */
+:root{--pick:#ffc53d}
+.swatch.pick{background:var(--pick)}
+.hint-click{font-size:12px}
+.frag{width:100%;border:none;font:inherit;text-align:left;cursor:pointer;
+transition:background .12s,color .12s}
+.frag:hover{background:#161b24;color:var(--fg)}
+.frag.is-noise:hover{background:#2a171a}
+.frag.on{outline:1px solid var(--pick);background:#231d10;color:#ffe6ab}
+.frag.on .dot{background:var(--pick)}
+.frag.on .frag-tag{color:var(--pick)}
+
+.body-bar{position:absolute;left:12px;right:12px;bottom:34px;display:flex;
+align-items:center;justify-content:space-between;gap:12px;background:#0d0f14e8;
+border:1px solid var(--line);border-left:3px solid var(--pick);border-radius:8px;
+padding:8px 12px;font-size:12px;color:var(--fg)}
+.body-bar.hidden{display:none}
+.body-bar b{color:var(--pick)}
+.body-actions{display:flex;gap:6px;flex-shrink:0}
+
+/* ---------- noise threshold ---------- */
+.ratio-row{display:flex;flex-direction:column;gap:5px}
+.ratio-row label{flex-direction:row;justify-content:space-between;align-items:baseline;
+font-size:12px;color:var(--dim)}
+.ratio-row output{color:var(--fg);font-variant-numeric:tabular-nums}
+.ratio-row input[type=range]{width:100%;padding:0;height:18px;accent-color:var(--noise);
+background:none;border:none;cursor:pointer}
+
+/* ---------- voxel pitch ---------- */
+.pitch-box{display:flex;flex-direction:column;gap:6px;padding:11px 13px;
+border:1px solid var(--line);border-radius:8px;background:#0d0f14}
+.pitch-box.hidden{display:none}
+.pitch-box label{flex-direction:row;justify-content:space-between;align-items:baseline;
+font-size:12px;color:var(--dim)}
+.pitch-box output{color:var(--fg);font-variant-numeric:tabular-nums}
+.pitch-box select{width:100%}
+.pitch-box select option:disabled{color:#5a6070}
+.pitch-note{margin:0;font-size:11.5px;color:var(--dim);line-height:1.5}
+.pitch-note b{color:var(--fg);font-variant-numeric:tabular-nums}

@@ -75,6 +75,13 @@
           <label class="chip"><input type="checkbox" id="toggle-ghost"> Ghost part</label>
         </div>
         <p class="viewer-loading" id="viewer-loading">loading geometry…</p>
+        <div class="body-bar hidden" id="body-bar">
+          <span id="body-info"></span>
+          <span class="body-actions">
+            <button type="button" class="chip" id="body-focus">Focus</button>
+            <button type="button" class="chip" id="body-clear">Clear</button>
+          </span>
+        </div>
       </div>
 
       <aside class="preview-side">
@@ -85,7 +92,22 @@
           <span class="swatch noise"></span> noise
         </p>
         <p class="rule" id="preview-rule"></p>
+        <div class="ratio-row">
+          <label for="ratio">Noise threshold
+            <output id="ratio-out"></output>
+          </label>
+          <input type="range" id="ratio" min="0.002" max="0.25" step="0.002" value="0.02">
+        </div>
+        <p class="rule hint-click">Click any body below to highlight it in <span class="swatch pick"></span> amber while the rest of the part stays visible.</p>
         <div class="frag-list" id="frag-list"></div>
+        <div class="pitch-box">
+          <label for="pitch">Voxel pitch
+            <output id="pitch-out"></output>
+          </label>
+          <select id="pitch"></select>
+          <p class="pitch-note" id="pitch-note"></p>
+        </div>
+
         <div class="preview-actions">
           <button type="button" id="denoise" class="btn danger">Remove noise</button>
           <button type="button" id="nest-now" class="btn">Nest it</button>
