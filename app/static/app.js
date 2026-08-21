@@ -9,6 +9,10 @@ const on  = (sel, ev, fn) => { const e = $(sel); if (e) e[ev] = fn; };
 const set = (sel, prop, val) => { const e = $(sel); if (e) e[prop] = val; };
 const fmt = (n) => n.toLocaleString(undefined, {maximumFractionDigits: 0});
 const dim = (n) => n.toLocaleString(undefined, {maximumFractionDigits: 2});
+// A run with gap measurement switched off reports no gap at all. Showing the
+// requested clearance here, or a dash that reads like zero, would both imply a
+// measurement that was never made.
+const gapText = (g) => (g == null ? 'not measured' : `${g.toFixed(3)} mm`);
 let jobId = null, poller = null, viewer = null, selected = null;
 // The clock ticks locally between polls and re-syncs to the server's figure on
 // every poll, so it reads smoothly without drifting away from the number the
@@ -387,7 +391,7 @@ function renderResults(job) {
     tr.innerHTML = `<td>${rec.rank}</td>
       <td>${e[0].toFixed(1)} × ${e[1].toFixed(1)} × ${e[2].toFixed(1)}</td>
       <td>${fmt(rec.volume)}</td><td>${fmt(rec.footprint)}</td>
-      <td>${e[2].toFixed(1)}</td><td>${rec.gap.toFixed(3)}</td>
+      <td>${e[2].toFixed(1)}</td><td>${rec.gap == null ? '<span class="unmeasured">not measured</span>' : rec.gap.toFixed(3)}</td>
       <td>${rec.pareto ? '<span class="pareto-dot"></span>' : ''}</td>`;
     tb.appendChild(tr);
 
@@ -406,7 +410,7 @@ function renderResults(job) {
           <b>${e[0].toFixed(1)} × ${e[1].toFixed(1)} × ${e[2].toFixed(1)}</b> mm<br>
           volume <b>${fmt(rec.volume)}</b> mm³<br>
           footprint <b>${fmt(rec.footprint)}</b> mm²<br>
-          gap <b>${rec.gap.toFixed(3)}</b> mm ${rec.refined ? '' : '(unrefined)'}
+          gap <b>${gapText(rec.gap)}</b> ${rec.gap == null ? '' : (rec.refined ? '' : '(unrefined)')}
         </p>
         <div class="card-actions">
           <button class="btn expand-btn">Inspect</button>
@@ -427,7 +431,7 @@ let modalViewer = null;
 function openModal(rec, url) {
   const e = rec.extents;
   $('#modal-title').textContent =
-    `#${rec.rank} — ${e[0].toFixed(1)} × ${e[1].toFixed(1)} × ${e[2].toFixed(1)} mm, gap ${rec.gap.toFixed(3)} mm`;
+    `#${rec.rank} — ${e[0].toFixed(1)} × ${e[1].toFixed(1)} × ${e[2].toFixed(1)} mm, gap ${gapText(rec.gap)}`;
   $('#modal-stl').href = `/api/jobs/${jobId}/rec/${rec.rank}/stl`;
   $('#modal-glb').href = url;
   show('#modal');

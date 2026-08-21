@@ -149,7 +149,7 @@ class JobStore:
                     "volume": round(r.volume, 1),
                     "footprint": round(r.footprint, 1),
                     "height": round(r.height, 2),
-                    "gap": round(r.gap, 4),
+                    "gap": None if r.gap is None else round(r.gap, 4),
                     "refined": r.refined, "pareto": r.pareto,
                     "transform": r.transform,
                     "stl": Path(r.stl).name,

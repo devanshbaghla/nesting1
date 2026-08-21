@@ -1497,8 +1497,17 @@ class Validation:
     float. These tests have analytic answers, so they cannot pass by accident.
     """
 
-    @staticmethod
-    def sphere_pair(radius: float = 10.0, centre_distance: float = 25.0,
+    #: Results of sphere_pair, keyed on its arguments. The test builds two
+    #: icospheres and measures a gap it already knows the answer to, so it
+    #: cannot depend on the part being nested and cannot change between jobs in
+    #: one process. It was still being re-run per job, and once the rest of the
+    #: pipeline was cut back that made it 81% of a run on sample.stl -- 1.78 s
+    #: of 2.23 s -- to re-derive a constant. Cached, the first job pays and the
+    #: rest are free, and the gate still runs exactly once per backend.
+    _SPHERE_CACHE: dict = {}
+
+    @classmethod
+    def sphere_pair(cls, radius: float = 10.0, centre_distance: float = 25.0,
                     subdivisions: int = 4, n: int = 50_000, backend=None) -> dict:
         """Two spheres: the surface gap is analytically ``d - 2r``.
 
@@ -1509,13 +1518,20 @@ class Validation:
         metric the run will actually use rather than a fixed one.
         """
         backend = backend or SurfacePairDistance
+        key = (float(radius), float(centre_distance), int(subdivisions),
+               int(n), backend.__name__)
+        hit = cls._SPHERE_CACHE.get(key)
+        if hit is not None:
+            return dict(hit)               # a copy: callers must not mutate it
         s = trimesh.creation.icosphere(subdivisions=subdivisions, radius=radius)
         t = np.array([centre_distance, 0.0, 0.0])
         d = backend(s, s.copy(), t, n_samples=n, move=0.0)
         got = d.exact(t)
         want = centre_distance - 2 * radius
-        return {"expected": want, "got": float(got),
-                "error": float(got - want), "pass": bool(abs(got - want) < 0.05)}
+        out = {"expected": want, "got": float(got),
+               "error": float(got - want), "pass": bool(abs(got - want) < 0.05)}
+        cls._SPHERE_CACHE[key] = out
+        return dict(out)
 
     @staticmethod
     def voxeliser(mesh: trimesh.Trimesh, pitch: float = 0.5,

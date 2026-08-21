@@ -252,6 +252,15 @@ class NestingConfig:
     diversity_angle: float = 10.0     # deg between distinct rotations
     diversity_extent: float = 3.0     # mm between distinct bounding boxes
 
+    #: Measure the true surface gap of each arrangement, and reject any that
+    #: misses the clearance. Off, nothing computes a surface distance at all:
+    #: the lattice pose is returned as-is, no gap is reported, and nothing is
+    #: rejected -- so results that violate the clearance are returned alongside
+    #: ones that meet it, indistinguishable. The lattice searched with
+    #: clearance + 1.5*pitch, so feasibility still holds *if* the voxelisation
+    #: is right, which at a coarse pitch is the assumption being relaxed.
+    #: Measured on auto_02_wishbone: 96.7% of the run.
+    measure_gap: bool = True
     #: Re-read each written STL from disk and re-measure its gap with a fresh
     #: seed. It is the only check that works on the file rather than on the
     #: meshes in memory, so it is the only thing that would catch a bad export
@@ -314,7 +323,8 @@ PROFILES = {
     "fast": dict(coarse_step=45.0, so3_step=None, refiner="none",
                  n_samples=40_000, cross_check=False, robustness_trials=2,
                  fine_step=6.0, coarse_pitch=8.0, fine_pitch=4.0,
-                 voxel_tolerance=0.25, auto_pitch=True, verify=False),
+                 voxel_tolerance=0.25, auto_pitch=True, verify=False,
+                 measure_gap=False),
     # fast sanity check on a new part
     # 'descend' is switched off (see DISABLED_ALGORITHMS), so quick refines
     # with the profile sweep. That is the more accurate of the two and much

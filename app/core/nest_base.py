@@ -64,7 +64,7 @@ class Recommendation:
     volume: float
     footprint: float
     height: float
-    gap: float
+    gap: float | None          # None when nothing measured it
     refined: bool
     pareto: bool = False
     stl: str = ""
@@ -76,7 +76,8 @@ class Recommendation:
         e = self.extents
         return (f"{self.rank:>2}  {e[0]:6.1f} x {e[1]:6.1f} x {e[2]:6.1f}  "
                 f"{self.volume:10,.0f}  {self.footprint:8,.0f}  "
-                f"{self.gap:6.3f}  {'P' if self.pareto else ' '}  {self.label}")
+                f"{'  n/a ' if self.gap is None else format(self.gap, '6.3f')}"
+                f"  {'P' if self.pareto else ' '}  {self.label}")
 
 
 # --------------------------------------------------------------------------- #
@@ -342,6 +343,11 @@ class NestingRecommender:
         is kept: still feasible, just looser than necessary.
         """
         T, t0 = cand["T"], cand["t"].copy()
+        if not self.cfg.measure_gap:
+            # Nothing is measured, so nothing can be reported. Returning the
+            # requested clearance here would be inventing a number the run
+            # never computed.
+            return t0, None, False
         strategy = NesterFactory.strategy(self.cfg)
         mB = mesh.copy(); mB.apply_transform(T)
         n = self.cfg.n_samples if strategy != "none" else 80_000
@@ -620,14 +626,14 @@ class NestingRecommender:
                 transform=M.tolist(), extents=e.tolist(),
                 volume=float(e.prod()), footprint=float(e[0] * e[1]),
                 height=float(e[2]), gap=gap, refined=refined)
-            if gap < self.cfg.clearance - 1e-3:
+            if gap is not None and gap < self.cfg.clearance - 1e-3:
                 rec.note = f"REJECTED: gap {gap:.4f} < {self.cfg.clearance}"
                 self._log(f"    {i:>2}. {rec.note}")
                 continue
             recs.append(rec)
             self._log(f"    {i:>2}. {e[0]:6.1f} x {e[1]:6.1f} x {e[2]:6.1f}  "
                       f"vol {rec.volume:10,.0f}  area {rec.footprint:8,.0f}  "
-                      f"gap {gap:.3f}")
+                      f"gap {'not measured' if gap is None else format(gap, '.3f')}")
 
         if not recs:
             raise RuntimeError("every candidate failed the clearance check")
@@ -698,7 +704,8 @@ class NestingRecommender:
             e = r.extents
             L.append(f"| {r.rank} | {e[0]:.1f} x {e[1]:.1f} x {e[2]:.1f} "
                      f"| {r.volume:,.0f} | {r.footprint:,.0f} | {e[2]:.1f} "
-                     f"| {r.gap:.3f} | {'yes' if r.pareto else ''} "
+                     f"| {'n/a' if r.gap is None else format(r.gap, '.3f')} "
+                     f"| {'yes' if r.pareto else ''} "
                      f"| {Path(r.stl).name} |")
         b = recs[0]
         L += ["", f"Best saves {100*(1-b.volume/best_naive['volume']):.1f}% of "
