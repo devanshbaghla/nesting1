@@ -627,6 +627,133 @@ class MeshSolidify:
             pitch *= 1.25
         return float(pitch)
 
+    # -- surface rasterisation ------------------------------------------------ #
+    #: Candidate (triangle, voxel) pairs tested per batch. Each pair carries
+    #: about 208 bytes of working arrays, so this caps the batch at ~50 MiB and
+    #: peak allocation at ~150 MiB on a 225k-face mesh. 3,000,000 was 594 MiB,
+    #: which is more than this machine has spare; the larger batch bought 8%.
+    RASTER_BUDGET = 250_000
+
+    @classmethod
+    def surface_voxels(cls, mesh: trimesh.Trimesh, pitch: float,
+                       origin=None, shape=None) -> tuple:
+        """Voxels the triangles pass through, on trimesh's own lattice.
+
+        Replaces ``mesh.voxelized(pitch).matrix``, which measured 99.4-99.7% of
+        :meth:`occupancy` and so 80-95% of the wait on any file that has to be
+        rebuilt. trimesh gets there by recursively *subdividing* every triangle
+        until the pieces are smaller than a voxel, so its cost tracks triangle
+        **size** rather than count: 624 large triangles took 7.9 s where
+        300,000 small ones took 0.12 s.
+
+        This tests triangle-box overlap directly (Akenine-Moller separating
+        axis theorem), vectorised over candidate pairs. Point sampling was
+        tried first and cannot be made safe: a triangle can clip the corner of
+        a cube with no sample landing inside it, and denser sampling did not
+        close the gap -- 25,301 voxels missed at 1.5 samples per voxel, still
+        24,869 at 5. A missed voxel is not cosmetic here, because it lets the
+        flood fill escape and returns a hollow husk.
+
+        Verified a **superset** of trimesh's output on nine meshes: never a
+        missed voxel, and the handful it adds are ones the triangle genuinely
+        touches that trimesh's sampling missed.
+
+        Lattice: trimesh places the centre of voxel (0,0,0) at the mesh's
+        minimum bound and steps by ``pitch``, so the index of a point is
+        ``rint((p - origin) / pitch)``.
+        """
+        tris = np.asarray(mesh.triangles, dtype=np.float64)
+        flat = tris.reshape(-1, 3)
+        if origin is None:
+            origin = flat.min(axis=0)
+        origin = np.asarray(origin, dtype=np.float64)
+        if shape is None:
+            shape = tuple(np.rint((flat.max(axis=0) - origin) / pitch
+                                  ).astype(np.int64) + 1)
+        dims = np.asarray(shape, dtype=np.int64)
+        occ = np.zeros(tuple(shape), dtype=bool)
+        h = 0.5 * pitch                              # box half-extent
+
+        # Exact candidate window: voxel k spans origin + k*pitch +/- pitch/2,
+        # so it can only meet the triangle where
+        #   k >= (tlo-origin)/pitch - 1/2  and  k <= (thi-origin)/pitch + 1/2.
+        # The overlap test is exact, so any slack beyond this only adds
+        # candidates that are always rejected.
+        tlo = tris.min(axis=1); thi = tris.max(axis=1)
+        klo = np.ceil((tlo - origin) / pitch - 0.5).astype(np.int64)
+        khi = np.floor((thi - origin) / pitch + 0.5).astype(np.int64)
+        np.clip(klo, 0, dims - 1, out=klo)
+        np.clip(khi, 0, dims - 1, out=khi)
+        span = np.maximum(khi - klo + 1, 0)
+        counts = span.prod(axis=1)
+
+        # A triangle whose window is one voxel lies inside that voxel by
+        # construction, so it intersects it and needs no test. On a dense mesh
+        # most triangles are smaller than a voxel and take this path.
+        single = counts == 1
+        if single.any():
+            occ[klo[single, 0], klo[single, 1], klo[single, 2]] = True
+
+        live = np.flatnonzero(counts > 1)
+        start = 0
+        while start < live.size:
+            run, tot = start, 0
+            while run < live.size and tot < cls.RASTER_BUDGET:
+                tot += int(counts[live[run]]); run += 1
+            sel = live[start:run]; start = run
+
+            c = counts[sel]
+            tri = np.repeat(sel, c)
+            off = np.arange(int(c.sum())) - np.repeat(np.cumsum(c) - c, c)
+            sy = np.repeat(span[sel, 1], c); sz = np.repeat(span[sel, 2], c)
+            ix = klo[tri, 0] + off // (sy * sz)
+            iy = klo[tri, 1] + (off // sz) % sy
+            iz = klo[tri, 2] + off % sz
+            centre = origin + np.stack([ix, iy, iz], axis=1) * pitch
+            v = tris[tri] - centre[:, None, :]        # box-centred triangle
+            e = np.stack([v[:, 1] - v[:, 0], v[:, 2] - v[:, 1],
+                          v[:, 0] - v[:, 2]], axis=1)
+
+            # Filter progressively, compressing between stages: the three
+            # box-face tests are three comparisons and reject most candidates,
+            # where running all thirteen on everything meant dozens of
+            # temporaries the width of the full candidate list.
+            keep = np.ones(len(tri), dtype=bool)
+            for a in range(3):
+                va = v[:, :, a]
+                keep &= ~((va.min(axis=1) > h) | (va.max(axis=1) < -h))
+            if not keep.any():
+                continue
+            k = np.flatnonzero(keep)
+            v, e, ix, iy, iz = v[k], e[k], ix[k], iy[k], iz[k]
+
+            nrm = np.cross(e[:, 0], e[:, 1])          # triangle plane vs box
+            keep = np.abs((nrm * v[:, 0]).sum(axis=1)) <= h * np.abs(nrm).sum(axis=1)
+            if not keep.any():
+                continue
+            k = np.flatnonzero(keep)
+            v, e, ix, iy, iz = v[k], e[k], ix[k], iy[k], iz[k]
+
+            ok = np.ones(len(ix), dtype=bool)         # nine edge x axis crosses
+            for ei in range(3):
+                for a in range(3):
+                    b, cc = (a + 1) % 3, (a + 2) % 3
+                    ax_b = -e[:, ei, cc]; ax_c = e[:, ei, b]
+                    proj = v[:, :, b] * ax_b[:, None] + v[:, :, cc] * ax_c[:, None]
+                    rr = h * (np.abs(ax_b) + np.abs(ax_c))
+                    ok &= ~((proj.min(axis=1) > rr) | (proj.max(axis=1) < -rr))
+                    if not ok.any():
+                        break
+                if not ok.any():
+                    break
+            if ok.any():
+                occ[ix[ok], iy[ok], iz[ok]] = True
+
+        transform = np.eye(4)
+        transform[:3, :3] *= pitch
+        transform[:3, 3] = origin
+        return occ, transform
+
     # -- occupancy ----------------------------------------------------------- #
     @classmethod
     def occupancy(cls, mesh: trimesh.Trimesh, pitch: float,
@@ -649,8 +776,7 @@ class MeshSolidify:
         from scipy import ndimage
 
         r = cls.CLOSE_VOXELS if close_voxels is None else int(close_voxels)
-        grid = mesh.voxelized(pitch=pitch)
-        surface = np.asarray(grid.matrix, dtype=bool)
+        surface, transform = cls.surface_voxels(mesh, pitch)
 
         pad = r + 1                            # room for the border flood
         work = np.pad(surface, pad)
@@ -659,7 +785,7 @@ class MeshSolidify:
         if r:
             filled = ndimage.binary_erosion(filled, iterations=r) | work
         solid = filled[pad:-pad, pad:-pad, pad:-pad].copy()
-        return solid, surface, np.asarray(grid.transform, float)
+        return solid, surface, transform
 
     @classmethod
     def _fill_leaked(cls, solid: np.ndarray) -> bool:
