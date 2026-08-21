@@ -43,6 +43,10 @@ class Job:
     stage: str = "queued"
     progress: float = 0.0
     created: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    #: when the worker picked it up, as opposed to when it was uploaded. A job
+    #: can sit queued behind another, and counting that against the run would
+    #: report a number the engine had no part in.
+    started: str | None = None
     finished: str | None = None
     error: str | None = None
     log: list = field(default_factory=list)
@@ -54,9 +58,23 @@ class Job:
     def dir(self) -> Path:
         return config.DATA_DIR / self.id
 
+    @property
+    def elapsed_s(self) -> float | None:
+        """Seconds the engine has been running, or took. None before it starts.
+
+        Served rather than timed in the browser so the figure survives a
+        reload and matches what the log reports.
+        """
+        if not self.started:
+            return None
+        end = (datetime.fromisoformat(self.finished) if self.finished
+               else datetime.now(timezone.utc))
+        return max(0.0, (end - datetime.fromisoformat(self.started)).total_seconds())
+
     def public(self) -> dict:
         d = asdict(self)
         d["log"] = self.log[-40:]
+        d["elapsed_s"] = self.elapsed_s
         return d
 
 
@@ -99,6 +117,7 @@ class JobStore:
     # -- worker ------------------------------------------------------------ #
     def _run(self, job: Job):
         job.status, job.stage = "running", "starting"
+        job.started = datetime.now(timezone.utc).isoformat()
         t0 = time.time()
         try:
             cfg = NesterFactory.config(

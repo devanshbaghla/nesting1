@@ -1,14 +1,43 @@
 import {PartViewer, PairViewer} from './viewer.js';
 
 const $ = (s) => document.querySelector(s);
+// The template is deliberately minimal -- it offers Preview and Nest and no
+// tuning controls -- so anything optional may simply not be on the page.
+// These keep the module working whichever controls exist rather than throwing
+// on the first missing one and taking the whole script down with it.
+const on  = (sel, ev, fn) => { const e = $(sel); if (e) e[ev] = fn; };
+const set = (sel, prop, val) => { const e = $(sel); if (e) e[prop] = val; };
 const fmt = (n) => n.toLocaleString(undefined, {maximumFractionDigits: 0});
 const dim = (n) => n.toLocaleString(undefined, {maximumFractionDigits: 2});
 let jobId = null, poller = null, viewer = null, selected = null;
+// The clock ticks locally between polls and re-syncs to the server's figure on
+// every poll, so it reads smoothly without drifting away from the number the
+// run actually reports.
+let ticker = null, elapsedBase = 0, elapsedAt = 0;
+
+const clock = (s) => {
+  const t = Math.max(0, Math.round(s));
+  return `${Math.floor(t / 60)}:${String(t % 60).padStart(2, '0')}`;
+};
+function startClock() {
+  stopClock();
+  elapsedBase = 0; elapsedAt = performance.now();
+  ticker = setInterval(() => {
+    set('#elapsed', 'textContent',
+        clock(elapsedBase + (performance.now() - elapsedAt) / 1000));
+  }, 250);
+}
+function syncClock(seconds) {
+  if (typeof seconds !== 'number') return;
+  elapsedBase = seconds; elapsedAt = performance.now();
+  set('#elapsed', 'textContent', clock(seconds));
+}
+function stopClock() { if (ticker) { clearInterval(ticker); ticker = null; } }
 let ratio = 0.02, reclassifyTimer = null, pitch = null;
 
 /* ---------- upload ---------- */
 const dz = $('#dropzone'), fileInput = $('#file');
-$('#browse').onclick = () => fileInput.click();
+on('#browse', 'onclick', () => fileInput.click());
 dz.onclick = (e) => { if (e.target.tagName !== 'BUTTON') fileInput.click(); };
 ['dragenter','dragover'].forEach(t => dz.addEventListener(t, e => {
   e.preventDefault(); dz.classList.add('over');
@@ -70,9 +99,8 @@ function renderPreview(p) {
   ].map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join('');
 
   ratio = p.ratio;
-  $('#ratio').value = p.ratio;
-  $('#ratio-out').textContent =
-    `${(p.ratio * 100).toFixed(1)}% — under ${dim(p.threshold)}`;
+  set('#ratio', 'value', p.ratio);
+  set('#ratio-out', 'textContent', `${(p.ratio * 100).toFixed(1)}% — under ${dim(p.threshold)}`);
   $('#preview-rule').innerHTML =
     `A body is <b>noise</b> only when it is small <b>both</b> ways: under
      <b>${dim(p.threshold)}</b> across (${(p.ratio * 100).toFixed(1)}% of the
@@ -101,6 +129,7 @@ function renderPreview(p) {
   renderPitch(p);
 
   const btn = $('#denoise');
+  if (!btn) return;
   btn.disabled = !p.has_noise;
   btn.textContent = p.has_noise
     ? `Remove ${p.noise_bodies} noise ${p.noise_bodies === 1 ? 'body' : 'bodies'}`
@@ -108,10 +137,10 @@ function renderPreview(p) {
   btn.title = p.has_noise
     ? `${fmt(p.noise_faces)} triangles will be deleted from the file to be nested`
     : '';
-  $('#toggle-noise').disabled = !p.has_noise;
-  $('#denoise-note').textContent = p.decimated_to
+  set('#toggle-noise', 'disabled', !p.has_noise);
+  set('#denoise-note', 'textContent', p.decimated_to
     ? `Preview decimated to ${fmt(p.decimated_to)} triangles for drawing; nesting uses the full mesh.`
-    : '';
+    : '');
 }
 
 /* The translation search allocates one array per orientation, sized by the
@@ -153,10 +182,10 @@ function describePitch(p) {
       ? ' <b>Coarser than needed</b> — a finer pitch would still fit.' : '');
 }
 
-$('#pitch').onchange = (e) => {
+on('#pitch', 'onchange', (e) => {
   pitch = Number(e.target.value);
   describePitch(lastPreview);
-};
+});
 
 async function loadGeometry() {
   const el = $('#viewer-loading');
@@ -168,11 +197,10 @@ async function loadGeometry() {
     if (!viewer) viewer = new PartViewer($('#preview-canvas'));
     clearSelection();
     viewer.load(payload);
-    viewer.setNoiseVisible($('#toggle-noise').checked);
-    viewer.setPartOpacity($('#toggle-ghost').checked ? 0.25 : 1);
+    viewer.setNoiseVisible($('#toggle-noise') ? $('#toggle-noise').checked : true);
+    viewer.setPartOpacity($('#toggle-ghost') && $('#toggle-ghost').checked ? 0.25 : 1);
     if (payload.decimated_to) {
-      $('#denoise-note').textContent =
-        `Preview decimated to ${fmt(payload.decimated_to)} triangles for drawing; nesting uses the full mesh.`;
+      set('#denoise-note', 'textContent', `Preview decimated to ${fmt(payload.decimated_to)} triangles for drawing; nesting uses the full mesh.`);
     }
   } catch (err) {
     el.textContent = err.message;
@@ -215,9 +243,9 @@ function clearSelection() {
 
 /* Dragging the threshold re-runs the rule server-side. Debounced, because a
    drag fires continuously and each pass reclassifies hundreds of bodies. */
-$('#ratio').oninput = (e) => {
+on('#ratio', 'oninput', (e) => {
   ratio = Number(e.target.value);
-  $('#ratio-out').textContent = `${(ratio * 100).toFixed(1)}% — recalculating…`;
+  set('#ratio-out', 'textContent', `${(ratio * 100).toFixed(1)}% — recalculating…`);
   clearTimeout(reclassifyTimer);
   reclassifyTimer = setTimeout(async () => {
     try {
@@ -227,24 +255,25 @@ $('#ratio').oninput = (e) => {
       renderPreview(data.preview);
       await loadGeometry();
     } catch (err) {
-      $('#ratio-out').textContent = err.message;
+      set('#ratio-out', 'textContent', err.message);
     }
   }, 350);
-};
+});
 
-$('#body-clear').onclick = clearSelection;
-$('#body-focus').onclick = () => viewer && viewer.focusSelection();
+on('#body-clear', 'onclick', clearSelection);
+on('#body-focus', 'onclick', () => viewer && viewer.focusSelection());
 document.addEventListener('keydown', e => {
   if (e.key === 'Escape' && selected !== null) clearSelection();
 });
 
-$('#view-reset').onclick = () => { clearSelection(); viewer && viewer.resetView(); };
-$('#toggle-noise').onchange = (e) => viewer && viewer.setNoiseVisible(e.target.checked);
-$('#toggle-ghost').onchange = (e) => viewer && viewer.setPartOpacity(e.target.checked ? 0.25 : 1);
-$('#preview-cancel').onclick = () => location.reload();
+on('#view-reset', 'onclick', () => { clearSelection(); viewer && viewer.resetView(); });
+on('#toggle-noise', 'onchange', (e) => viewer && viewer.setNoiseVisible(e.target.checked));
+on('#toggle-ghost', 'onchange', (e) => viewer && viewer.setPartOpacity(e.target.checked ? 0.25 : 1));
+on('#preview-cancel', 'onclick', () => location.reload());
 
-$('#denoise').onclick = async () => {
+on('#denoise', 'onclick', async () => {
   const btn = $('#denoise');
+  if (!btn) return;
   btn.disabled = true; btn.textContent = 'Removing…';
   try {
     const r = await fetch(`/api/preview/${jobId}/denoise?ratio=${ratio}`, {method: 'POST'});
@@ -252,15 +281,14 @@ $('#denoise').onclick = async () => {
     if (!r.ok) throw new Error(data.detail || 'denoise failed');
     renderPreview(data.preview);
     await loadGeometry();
-    $('#denoise-note').textContent =
-      `Removed ${data.removed} ${data.removed === 1 ? 'fragment' : 'fragments'} (${fmt(data.removed_faces || 0)} triangles). The file to be nested has been updated.`;
+    set('#denoise-note', 'textContent', `Removed ${data.removed} ${data.removed === 1 ? 'fragment' : 'fragments'} (${fmt(data.removed_faces || 0)} triangles). The file to be nested has been updated.`);
   } catch (err) {
-    $('#denoise-note').textContent = err.message;
+    set('#denoise-note', 'textContent', err.message);
     btn.disabled = false;
   }
-};
+});
 
-$('#nest-now').onclick = async () => {
+on('#nest-now', 'onclick', async () => {
   const btn = $('#nest-now');
   btn.disabled = true; btn.textContent = 'Starting…';
   try {
@@ -269,30 +297,40 @@ $('#nest-now').onclick = async () => {
     const data = await r.json();
     if (!r.ok) throw new Error(data.detail || 'could not start the run');
     hide('#preview-panel'); show('#progress-panel');
+    startClock();
     poller = setInterval(poll, 1200); poll();
   } catch (err) {
     fail(err.message);
     hide('#preview-panel');
   } finally { btn.disabled = false; btn.textContent = 'Nest it'; }
-};
+});
 
 /* ---------- polling ---------- */
 async function poll() {
   const r = await fetch(`/api/jobs/${jobId}`);
   const j = await r.json();
+  syncClock(j.elapsed_s);
   $('#bar').style.width = `${(j.progress * 100).toFixed(0)}%`;
   $('#stage').textContent = `${j.stage} — ${(j.progress*100).toFixed(0)}%`;
   $('#log').textContent = (j.log || []).join('\n');
   $('#log').scrollTop = $('#log').scrollHeight;
-  if (j.status === 'done') { clearInterval(poller); hide('#progress-panel'); renderResults(j); }
-  if (j.status === 'failed') { clearInterval(poller); hide('#progress-panel'); fail(j.error || 'the job failed'); }
+  if (j.status === 'done') {
+    clearInterval(poller); stopClock(); hide('#progress-panel');
+    set('#took', 'textContent',
+        j.elapsed_s != null ? `finished in ${clock(j.elapsed_s)} (${j.elapsed_s.toFixed(1)} s)` : '');
+    renderResults(j);
+  }
+  if (j.status === 'failed') {
+    clearInterval(poller); stopClock(); hide('#progress-panel');
+    fail(j.error || 'the job failed');
+  }
 }
 
 function fail(msg) { $('#error-msg').textContent = msg; show('#error-panel'); show('#upload-panel'); }
 const show = (s) => $(s).classList.remove('hidden');
 const hide = (s) => $(s).classList.add('hidden');
-$('#retry').onclick = () => { hide('#error-panel'); show('#upload-panel'); };
-$('#again').onclick = () => location.reload();
+on('#retry', 'onclick', () => { hide('#error-panel'); show('#upload-panel'); });
+on('#again', 'onclick', () => location.reload());
 
 /* ---------- live viewers, kept to a budget -----------------------------------
  * A browser will only hand out a limited number of WebGL contexts — well under
@@ -410,20 +448,20 @@ function closeModal() {
   if (modalViewer) { modalViewer.dispose(); modalViewer = null; }
   isolated = null;
 }
-$('#modal-close').onclick = closeModal;
-$('#modal').onclick = (e) => { if (e.target.id === 'modal') closeModal(); };
+on('#modal-close', 'onclick', closeModal);
+on('#modal', 'onclick', (e) => { if (e.target.id === 'modal') closeModal(); });
 document.addEventListener('keydown', e => { if (e.key === 'Escape') closeModal(); });
 
-$('#modal-reset').onclick = () => modalViewer && modalViewer.resetView();
-$('#view-spin').onchange = (e) => modalViewer && modalViewer.setSpin(e.target.checked);
+on('#modal-reset', 'onclick', () => modalViewer && modalViewer.resetView());
+on('#view-spin', 'onchange', (e) => modalViewer && modalViewer.setSpin(e.target.checked));
 
 // Cycling which copy is solid is how you check an interlock: dim one and the
 // mating faces of the other become visible from the inside.
 let isolated = null;
-$('#view-isolate').onclick = () => {
+on('#view-isolate', 'onclick', () => {
   if (!modalViewer) return;
   isolated = isolated === null ? 0 : isolated === 0 ? 1 : null;
   modalViewer.isolate(isolated);
   $('#view-isolate').textContent =
     isolated === null ? 'Isolate a copy' : `Showing copy ${'AB'[isolated]}`;
-};
+});

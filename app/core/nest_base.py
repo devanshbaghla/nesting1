@@ -45,7 +45,7 @@ import trimesh
 from .mesh_repair import (DenoiseReport, MeshDenoise, MeshRepair,
                           MeshRepairError, RepairReport)
 from .nesting3d import (
-    Geometry, MeshAudit, NestResult, PairNester, Preview, Refiner,
+    Geometry, ScanlineVoxelizer, MeshAudit, NestResult, PairNester, Preview, Refiner,
     SurfacePairDistance, SurfaceSampleCache, Validation,
 )
 from .nesting_factory import (
@@ -125,6 +125,64 @@ class NestingRecommender:
                       "input, so every dimension below carries that tolerance")
         return mesh
 
+    # -- 1b. pick the lattice ---------------------------------------------- #
+    #: candidate fine pitches, coarsest first. The search stops at the first
+    #: one that passes, so a part that tolerates a coarse lattice pays one or
+    #: two cheap gate evaluations and nothing more.
+    PITCH_LADDER = (4.0, 3.0, 2.0, 1.5, 1.0, 0.5)
+    #: never choose a pitch that leaves fewer than this many voxels across the
+    #: part's thinnest axis, whatever the volume gate says. A thin wall can
+    #: pass on total volume while being one voxel thick, and an interlock
+    #: resolved at one voxel is not resolved at all.
+    MIN_VOXELS_THINNEST = 12
+
+    def choose_pitch(self, mesh) -> dict:
+        """Coarsest lattice this mesh still passes the accuracy gate on.
+
+        Cost is cubic in ``1/pitch``, and the shipped 0.5 mm default was chosen
+        for one reference part rather than derived. Measured across seven parts
+        the coarsest passing pitch ranges 0.5 mm to 4.0 mm, so a fixed default
+        either overpays on most of them or is refused on the rest.
+
+        The gate is **not monotone in pitch** -- hook.stl fails at 1.0 and 1.5
+        and passes at 2.0, auto_05_clevis fails at 1.5, 2.0 and 3.0 and passes
+        at 4.0 -- because the error depends on how the lattice happens to land
+        on the features. So this searches rather than predicts, and it searches
+        coarsest-first so the cheap evaluations come first.
+
+        Nothing here loosens the gate: every candidate must pass the same 2%
+        volume-error and rotation-robustness test the run would have applied
+        anyway. It only stops paying for resolution the gate does not ask for.
+        """
+        thinnest = float(np.min(mesh.extents))
+        chosen, tried = None, []
+        for pitch in self.PITCH_LADDER:
+            if thinnest / pitch < self.MIN_VOXELS_THINNEST:
+                tried.append(f"{pitch} too coarse for a {thinnest:.1f} mm axis")
+                continue
+            if pitch < self.cfg.fine_pitch:
+                break                      # do not refine past the request
+            # Screen on the axis-aligned error first: that is one voxelisation,
+            # where the full gate is seven (it re-voxelises under six random
+            # rotations). Screening first made the search cheap enough to be
+            # worth running -- doing the full gate per candidate cost more than
+            # a coarser lattice saved on a part where nothing coarser passed.
+            axis = ScanlineVoxelizer.volume_error(mesh, pitch)
+            if abs(axis) >= self.cfg.voxel_tolerance:
+                tried.append(f"{pitch} off by {100*axis:+.2f}%")
+                continue
+            # only the survivor pays for the rotation-robustness half
+            v = Validation.voxeliser(mesh, pitch, tol=self.cfg.voxel_tolerance,
+                                     trials=self.cfg.robustness_trials)
+            if v["pass"]:
+                chosen = pitch
+                break
+            tried.append(f"{pitch} rotated off by "
+                         f"{100*v['rotated']['max_abs']:.2f}%")
+        if chosen is None:
+            chosen = self.cfg.fine_pitch   # fall back to what was configured
+        return {"fine": chosen, "coarse": 2.0 * chosen, "rejected": tried}
+
     # -- 2. audit + self-tests (gates) ------------------------------------- #
     def audit(self, mesh) -> dict:
         rep = MeshAudit(mesh).assert_usable()
@@ -136,6 +194,7 @@ class NestingRecommender:
 
     def self_test(self, mesh) -> dict:
         vox = Validation.voxeliser(mesh, self.cfg.fine_pitch,
+                                   tol=self.cfg.voxel_tolerance,
                                    trials=self.cfg.robustness_trials)
         # gate the metric this run will use, not a fixed one
         sph = Validation.sphere_pair(n=40_000,
@@ -146,8 +205,51 @@ class NestingRecommender:
         self._log(f"    sphere pair {sph['got']:.4f} vs {sph['expected']}  "
                   f"[{'pass' if sph['pass'] else 'FAIL'}]")
         if not (vox["pass"] and sph["pass"]):
-            raise RuntimeError("primitive self-tests failed; refusing to nest")
-        return {"voxeliser": vox, "sphere_pair": sph}
+            # Name the number that failed and what would admit it. The bare
+            # "primitive self-tests failed" sent people hunting: setting a
+            # coarse fine_pitch on its own always trips this, because the
+            # tolerance is a separate knob and still at its 2% default.
+            why = []
+            tol = 100 * self.cfg.voxel_tolerance
+            if not vox["pass"]:
+                axis = 100 * vox["axis_aligned_error"]
+                rot = 100 * vox["rotated"]["max_abs"]
+                worst = max(abs(axis), rot)
+                why.append(
+                    f"the {self.cfg.fine_pitch} mm lattice reproduces this "
+                    f"part's volume to {axis:+.2f}% axis-aligned and "
+                    f"{rot:.2f}% under rotation, against a {tol:.0f}% "
+                    f"tolerance. Use a finer fine_pitch, or accept the error "
+                    f"by raising voxel_tolerance above {worst:.2f}% "
+                    f"(the 'fast' profile sets 25% and skips refinement)")
+            if not sph["pass"]:
+                why.append(
+                    f"the distance metric measured {sph['got']:.4f} on two "
+                    f"spheres whose true gap is {sph['expected']}, which is a "
+                    f"fault in the metric rather than in your file")
+            raise RuntimeError("refusing to nest: " + "; ".join(why))
+        # A relaxed gate or a skipped refinement changes what the delivered
+        # numbers mean, so it is recorded with the result rather than left for
+        # someone to infer from the profile name.
+        caveats = []
+        if self.cfg.voxel_tolerance > 0.02:
+            caveats.append(
+                f"the voxeliser gate was relaxed to "
+                f"{100*self.cfg.voxel_tolerance:.0f}% volume error (default 2%), "
+                f"and this lattice came in at "
+                f"{100*vox['axis_aligned_error']:+.2f}%")
+        if self.cfg.refiner == "none":
+            caveats.append(
+                "continuous refinement was skipped, so each gap is whatever "
+                "the lattice left and is looser than the clearance requested, "
+                "not squeezed to it")
+        if self.cfg.fine_pitch > 1.0:
+            caveats.append(
+                f"the lattice is {self.cfg.fine_pitch} mm, so a reported "
+                f"dimension carries roughly that quantisation")
+        for c in caveats:
+            self._log(f"    CAVEAT {c}")
+        return {"voxeliser": vox, "sphere_pair": sph, "caveats": caveats}
 
     # -- 3. sweep ---------------------------------------------------------- #
     def sweep(self, mesh, pitch, orientations) -> list:
@@ -434,9 +536,27 @@ class NestingRecommender:
         part A against a differently rotated B, and leaving the block drops the
         entries so no geometry survives into the next job.
         """
-        with SurfaceSampleCache() as pool:
-            self.sample_cache = pool
-            return self._recommend(stl_path, out_dir, top_n)
+        asked = (self.cfg.coarse_pitch, self.cfg.fine_pitch)
+        try:
+            with SurfaceSampleCache() as pool:
+                self.sample_cache = pool
+                return self._recommend(stl_path, out_dir, top_n)
+        except (RuntimeError, MeshRepairError) as exc:
+            # A coarser lattice is only worth choosing if it cannot cost an
+            # answer. It can: on electric_drill.stl the 2 mm lattice put the
+            # refiner on a pose it could not walk back to feasible, and the run
+            # died where the 0.5 mm lattice succeeds. So the speed-up is
+            # attempted, and the configured pitch is what actually has to work.
+            if (not self.cfg.auto_pitch
+                    or (self.cfg.coarse_pitch, self.cfg.fine_pitch) == asked):
+                raise
+            self._log(f"    the chosen lattice failed ({exc}); retrying at the "
+                      f"requested {asked[1]} mm")
+            self.cfg.coarse_pitch, self.cfg.fine_pitch = asked
+            self.cfg.auto_pitch = False
+            with SurfaceSampleCache() as pool:
+                self.sample_cache = pool
+                return self._recommend(stl_path, out_dir, top_n)
 
     def _recommend(self, stl_path, out_dir, top_n) -> list[Recommendation]:
         stl_path = Path(stl_path)
@@ -452,6 +572,17 @@ class NestingRecommender:
 
         self._log("\n[1/8] load")
         mesh = self.load(stl_path)
+        if self.cfg.auto_pitch:
+            pick = self.choose_pitch(mesh)
+            if pick["fine"] != self.cfg.fine_pitch:
+                self._log(f"    lattice: {pick['fine']} mm fine / "
+                          f"{pick['coarse']} mm coarse "
+                          f"(was {self.cfg.fine_pitch} / {self.cfg.coarse_pitch})")
+                for why in pick["rejected"]:
+                    self._log(f"      rejected {why}")
+                self.cfg.fine_pitch = pick["fine"]
+                self.cfg.coarse_pitch = pick["coarse"]
+
         self._log("[2/8] audit (gate)")
         audit = self.audit(mesh)
         self._log("[3/8] primitive self-tests (gate)")

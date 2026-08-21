@@ -14,8 +14,17 @@ MAX_FACES = int(os.getenv("NEST_MAX_FACES", 0))
 JOB_WORKERS = int(os.getenv("NEST_JOB_WORKERS", 1))     # engine is single-core
 JOB_TTL_HOURS = float(os.getenv("NEST_JOB_TTL_HOURS", 24))
 
-DEFAULT_PROFILE = os.getenv("NEST_DEFAULT_PROFILE", "quick")
+#: The UI offers no tuning controls, so this is what every run uses.
+#: 'fast' trades accuracy for speed on purpose -- it skips the continuous
+#: refinement, so a delivered gap is whatever the lattice left rather than
+#: the clearance requested. Measured against 'quick': 8x faster on
+#: electric_drill for a 2% larger box, but 5x faster on diamonds for a box
+#: three times the size and a 26 mm gap where 5 mm was asked for.
+#: Set NEST_DEFAULT_PROFILE=quick to get the accurate engine back.
+DEFAULT_PROFILE = os.getenv("NEST_DEFAULT_PROFILE", "fast")
 #: "sampled" (no extra dependency) or "bvh" (needs python-fcl, far faster)
 DEFAULT_DISTANCE_BACKEND = os.getenv("NEST_DISTANCE_BACKEND", "sampled")
 DEFAULT_CLEARANCE = float(os.getenv("NEST_DEFAULT_CLEARANCE", 5.0))
-DEFAULT_TOP_N = int(os.getenv("NEST_DEFAULT_TOP_N", 10))
+#: Stage 7 (refine, export, verify) scales linearly with this, so it is the
+#: cheapest lever left once the profile is fixed.
+DEFAULT_TOP_N = int(os.getenv("NEST_DEFAULT_TOP_N", 5))

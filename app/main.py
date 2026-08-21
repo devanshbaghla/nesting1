@@ -61,7 +61,8 @@ def index(request: Request):
     return templates.TemplateResponse(request, "index.html", {
         "profiles": sorted(PROFILES),
         "objectives": AlgorithmRegistry.names("objective"),
-        "refiners": AlgorithmRegistry.names("refiner"),
+        "refiners": AlgorithmRegistry.enabled_names("refiner"),
+        "default_refiner": _default_refiner(),
         "backends": [b for b in AlgorithmRegistry.names("distance_backend")
                      if b != "bvh" or HAVE_FCL],
         "defaults": {"profile": config.DEFAULT_PROFILE,
@@ -81,7 +82,9 @@ async def create_job(
     top_n: int = Form(config.DEFAULT_TOP_N),
     profile: str = Form(config.DEFAULT_PROFILE),
     objective: str = Form("volume"),
-    refiner: str = Form("descend"),
+    # None means "whatever the chosen profile specifies", which is how a
+    # disabled refiner stops being a problem the caller has to know about
+    refiner: str | None = Form(None),
     distance_backend: str = Form(config.DEFAULT_DISTANCE_BACKEND),
 ):
     params = _validated_params(file, clearance, top_n, profile, objective,
@@ -104,8 +107,16 @@ async def create_job(
     return {"job_id": job.id, "status": job.status, "mesh": stats}
 
 
+def _default_refiner() -> str:
+    """The refiner the form should pre-select: the standard profile's, if it
+    is still enabled, else whatever remains."""
+    avail = AlgorithmRegistry.enabled_names("refiner")
+    want = PROFILES.get("standard", {}).get("refiner")
+    return want if want in avail else (avail[0] if avail else "")
+
+
 def _validated_params(file: UploadFile, clearance: float, top_n: int,
-                      profile: str, objective: str, refiner: str,
+                      profile: str, objective: str, refiner: str | None,
                       distance_backend: str) -> dict:
     """Reject a bad request before a byte is written to disk."""
     name = Path(file.filename or "part.stl").name
@@ -115,8 +126,12 @@ def _validated_params(file: UploadFile, clearance: float, top_n: int,
         raise HTTPException(400, f"unknown profile; choose from {sorted(PROFILES)}")
     if objective not in AlgorithmRegistry.names("objective"):
         raise HTTPException(400, "unknown objective")
-    if refiner not in AlgorithmRegistry.names("refiner"):
-        raise HTTPException(400, "unknown refiner")
+    if refiner is not None and refiner not in AlgorithmRegistry.enabled_names("refiner"):
+        off = AlgorithmRegistry.names("refiner")
+        raise HTTPException(
+            400, f"refiner {refiner!r} is not available; choose from "
+                 f"{AlgorithmRegistry.enabled_names('refiner')}"
+                 + (f" ({refiner!r} is switched off)" if refiner in off else ""))
     if distance_backend not in AlgorithmRegistry.names("distance_backend"):
         raise HTTPException(400, "unknown distance backend")
     if distance_backend == "bvh" and not HAVE_FCL:
@@ -160,7 +175,9 @@ async def create_preview(
     top_n: int = Form(config.DEFAULT_TOP_N),
     profile: str = Form(config.DEFAULT_PROFILE),
     objective: str = Form("volume"),
-    refiner: str = Form("descend"),
+    # None means "whatever the chosen profile specifies", which is how a
+    # disabled refiner stops being a problem the caller has to know about
+    refiner: str | None = Form(None),
     distance_backend: str = Form(config.DEFAULT_DISTANCE_BACKEND),
 ):
     """Upload and inspect, without starting anything.

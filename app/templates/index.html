@@ -9,7 +9,7 @@
 <body>
 <header>
   <h1>STL Nesting</h1>
-  <p class="sub">Two copies of your part, arranged for minimum bounding box, with a guaranteed minimum surface clearance.</p>
+  <p class="sub">Two copies of your part, arranged for the smallest bounding box. Tuned for speed: see the caveats on each result.</p>
 </header>
 
 <main>
@@ -21,41 +21,7 @@
         <p class="hint" id="filehint">Open meshes are repaired automatically. Up to 300 MB.</p>
       </div>
 
-      <div class="grid-opts">
-        <label>Clearance (file units)
-          <input type="number" name="clearance" value="{{ defaults.clearance }}" step="0.1" min="0">
-        </label>
-        <label>Recommendations
-          <input type="number" name="top_n" value="{{ defaults.top_n }}" min="1" max="20">
-        </label>
-        <label>Profile
-          <select name="profile">
-            {% for p in profiles %}<option value="{{ p }}" {% if p == defaults.profile %}selected{% endif %}>{{ p }}</option>{% endfor %}
-          </select>
-        </label>
-        <label>Rank by
-          <select name="objective">
-            {% for o in objectives %}<option value="{{ o }}">{{ o }}</option>{% endfor %}
-          </select>
-        </label>
-        <label>Refinement
-          <select name="refiner">
-            {% for r in refiners %}<option value="{{ r }}" {% if r == 'descend' %}selected{% endif %}>{{ r }}</option>{% endfor %}
-          </select>
-        </label>
-        {% if backends|length > 1 %}
-        <label>Distance
-          <select name="distance_backend">
-            {% for b in backends %}<option value="{{ b }}" {% if b == defaults.backend %}selected{% endif %}>{{ b }}</option>{% endfor %}
-          </select>
-        </label>
-        {% endif %}
-      </div>
-      <p class="note">
-        <strong>quick</strong> ~1–3 min · <strong>standard</strong> ~10 min · <strong>full</strong> adds a 744-orientation sweep.
-        Refinement <strong>none</strong> is fastest but leaves gaps looser than requested; <strong>profile</strong> squeezes closest.
-      </p>
-      <button type="submit" id="submit">Preview part</button>
+      <button type="submit" id="submit">Preview</button>
     </form>
   </section>
 
@@ -92,12 +58,6 @@
           <span class="swatch noise"></span> noise
         </p>
         <p class="rule" id="preview-rule"></p>
-        <div class="ratio-row">
-          <label for="ratio">Noise threshold
-            <output id="ratio-out"></output>
-          </label>
-          <input type="range" id="ratio" min="0.002" max="0.25" step="0.002" value="0.02">
-        </div>
         <p class="rule hint-click">Click any body below to highlight it in <span class="swatch pick"></span> amber while the rest of the part stays visible.</p>
         <div class="frag-list" id="frag-list"></div>
         <div class="pitch-box">
@@ -109,8 +69,7 @@
         </div>
 
         <div class="preview-actions">
-          <button type="button" id="denoise" class="btn danger">Remove noise</button>
-          <button type="button" id="nest-now" class="btn">Nest it</button>
+          <button type="button" id="nest-now" class="btn">Nest</button>
         </div>
         <p class="note" id="denoise-note"></p>
       </aside>
@@ -118,7 +77,10 @@
   </section>
 
   <section class="panel hidden" id="progress-panel">
-    <h2>Working <span class="spinner"></span></h2>
+    <div class="working-head">
+      <h2>Working <span class="spinner"></span></h2>
+      <span class="clock" id="elapsed">0:00</span>
+    </div>
     <div class="bar"><div class="bar-fill" id="bar"></div></div>
     <p id="stage" class="stage">queued</p>
     <pre id="log"></pre>
@@ -132,7 +94,7 @@
 
   <section class="hidden" id="results">
     <div class="results-head">
-      <h2>Recommendations</h2>
+      <h2>Recommendations <span class="took" id="took"></span></h2>
       <div>
         <a id="dl-all" class="btn ghost" href="#">Download all</a>
         <button type="button" id="again" class="btn ghost">New part</button>

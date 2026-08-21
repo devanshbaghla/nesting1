@@ -134,6 +134,87 @@ PT_TRI_K = 8
 
 
 # --------------------------------------------------------------------------- #
+#  Algorithm switchboard
+# --------------------------------------------------------------------------- #
+#: Algorithms switched off, with the reason. Nothing is deleted: the code stays
+#: in the module, keeps its tests, and is re-enabled by removing an entry here.
+#:
+#: The shortlist that drove this was ranked on *accuracy* and *cost*. Neither
+#: axis says anything about whether an algorithm can be switched off, so the
+#: call graph was checked per candidate and five of the ten could not be. They
+#: are recorded in ``LOAD_BEARING`` below rather than silently kept, so the
+#: disagreement between the shortlist and the code is visible.
+DISABLED_ALGORITHMS: dict[str, str] = {
+    "slice_profile":
+        "planar cross-section profile: unreachable already -- Inspector is "
+        "referenced nowhere outside its own module, and it recorded 0 calls "
+        "across 23 profiled runs.",
+    "pair_nester_verify":
+        "connected-component body split check: superseded by "
+        "NestingRecommender.verify_one, which is shortlist #7. 0 calls across "
+        "23 profiled runs.",
+    "so3":
+        "ZXZ Euler SO(3) grid sweep: only the 'full' profile requests it, so "
+        "disabling it makes 'full' behave as 'standard'. The rotation is then "
+        "assumed from the Z-family rather than proven over SO(3).",
+    "descend":
+        "coordinate descent with step halving: replaced by the profile sweep, "
+        "shortlist #9, which is what the accuracy ranking preferred -- descent "
+        "can settle on the wrong side of a feasibility discontinuity. The "
+        "'quick' profile therefore refines with 'profile' instead, which is "
+        "markedly slower: measured 3,059 KD queries against 61 on one part.",
+}
+
+#: Candidates from the same shortlist exercise that CANNOT be switched off,
+#: because a shortlisted algorithm calls them directly. Kept as a record of
+#: why, with the call site that proves it.
+LOAD_BEARING: dict[str, str] = {
+    "outward feasibility repair":
+        "switched off on the evidence of 0 calls across 23 profiled runs, then "
+        "switched back on within one change. Choosing a coarser lattice made "
+        "the lattice search hand the refiner an infeasible start on "
+        "electric_drill.stl, which is precisely the case Refiner.repair exists "
+        "for, and the run died with AlgorithmDisabled. 'Never observed' is not "
+        "'unreachable' -- it only meant nothing had yet exercised the path.",
+    "EDT dilation of free space":
+        "TranslationOracle.search reads ClearanceGrid.grid and correlates it "
+        "(nesting3d.py, 'A = self.cg.grid' then fftconvolve). Shortlist #3 has "
+        "nothing to correlate without it, and the clearance constraint the "
+        "service guarantees is exactly that grid.",
+    "slice-wise masked argmin":
+        "TranslationOracle.search calls _argmin twice, and it is the only "
+        "place a translation is extracted from the free-translation map. "
+        "Without it shortlist #3 computes the map and no pose is ever chosen.",
+    "area-weighted barycentric sampling":
+        "SurfacePairDistance.__init__ builds self.pA/self.pB from _sample. "
+        "Shortlist #1, #2 and #6 all operate on those point clouds.",
+    "KD-tree point-to-point minimum":
+        "shortlist #2 is not a separate algorithm from this one -- the "
+        "translation-bounded prune is the body of min_distance_to. Disabling "
+        "the query removes the prune with it.",
+    "concatenate + origin-corner shift":
+        "NestingRecommender._assembly is what export_one writes as the STL and "
+        "the GLB. Without it there is no final nested object to return, which "
+        "is the output being asked for.",
+}
+
+
+class AlgorithmDisabled(RuntimeError):
+    """Raised when a switched-off algorithm is invoked."""
+
+
+def _refuse(key: str):
+    """Raise for a disabled algorithm, quoting the recorded reason."""
+    raise AlgorithmDisabled(
+        f"{key!r} is switched off in DISABLED_ALGORITHMS: "
+        f"{DISABLED_ALGORITHMS[key]}")
+
+
+def algorithm_enabled(key: str) -> bool:
+    return key not in DISABLED_ALGORITHMS
+
+
+# --------------------------------------------------------------------------- #
 #  Intake
 # --------------------------------------------------------------------------- #
 class MeshAudit:
@@ -229,6 +310,11 @@ class ScanlineVoxelizer:
     JX = 1.4142135e-4
     JY = 1.7320508e-4
 
+    #: candidate columns expanded at once. Bounds peak memory on meshes
+    #: with a few oversized triangles, where one window can be most of
+    #: the lattice; 4M columns is about 100 MB of working arrays.
+    RASTER_CHUNK = 4_000_000
+
     @classmethod
     def rasterize(cls, mesh: trimesh.Trimesh, pitch: float):
         """Return ``(occ, i0)``.
@@ -260,22 +346,51 @@ class ScanlineVoxelizer:
         iylo = np.clip(np.floor((tlo[:, 1] - cls.JY) / pitch - 0.5).astype(np.int64) - 1 - i0[1], 0, ny - 1)
         iyhi = np.clip(np.ceil((thi[:, 1] - cls.JY) / pitch - 0.5).astype(np.int64) + 1 - i0[1], 0, ny - 1)
 
+        # Every triangle's candidate window, expanded and tested in one pass
+        # rather than one numpy call per triangle. The loop this replaces was
+        # 90% of rasterize (2.490 s of 2.768 s measured), and on a 1.5M-face
+        # part it ran 1.5 million times per call.
+        #
+        # The barycentric test below is unchanged and still authoritative; all
+        # that changes is that the (triangle, column) pairs are enumerated as
+        # one flat array. Chunked over triangles so peak memory stays bounded
+        # on meshes with a few huge triangles, where one window can cover a
+        # large slice of the lattice on its own.
+        wx = (ixhi - ixlo + 1)
+        wy = (iyhi - iylo + 1)
+        live = np.flatnonzero((wx > 0) & (wy > 0))
         cols, zhit = [], []
-        for t in range(len(v0)):
-            a, b, c, d = ixlo[t], ixhi[t], iylo[t], iyhi[t]
-            if b < a or d < c:
-                continue
-            px = xs[a:b + 1][:, None] - v0[t, 0]
-            py = ys[c:d + 1][None, :] - v0[t, 1]
-            u = (px * e2[t, 1] - py * e2[t, 0]) / denom[t]
-            v = (py * e1[t, 0] - px * e1[t, 1]) / denom[t]
-            inside = (u >= 0) & (v >= 0) & (u + v <= 1)
-            if not inside.any():
-                continue
-            ii, jj = np.nonzero(inside)
-            z = v0[t, 2] + u[inside] * e1[t, 2] + v[inside] * e2[t, 2]
-            cols.append((ii + a) * ny + (jj + c))
-            zhit.append(z)
+        if len(live):
+            counts_all = (wx[live] * wy[live]).astype(np.int64)
+            # walk triangles in chunks of roughly CHUNK candidate columns
+            edges, run = [0], 0
+            for i, c in enumerate(counts_all):
+                run += int(c)
+                if run >= cls.RASTER_CHUNK:
+                    edges.append(i + 1); run = 0
+            if edges[-1] != len(live):
+                edges.append(len(live))
+            for lo_i, hi_i in zip(edges[:-1], edges[1:]):
+                sel = live[lo_i:hi_i]
+                cnt = (wx[sel] * wy[sel]).astype(np.int64)
+                tri = np.repeat(sel, cnt)
+                # offset of each candidate within its own triangle's window
+                starts = np.concatenate(([0], np.cumsum(cnt)[:-1]))
+                off = np.arange(int(cnt.sum())) - np.repeat(starts, cnt)
+                wyr = np.repeat(wy[sel], cnt)
+                ix = ixlo[tri] + off // wyr
+                iy = iylo[tri] + off % wyr
+                px = xs[ix] - v0[tri, 0]
+                py = ys[iy] - v0[tri, 1]
+                dn = denom[tri]
+                u = (px * e2[tri, 1] - py * e2[tri, 0]) / dn
+                v = (py * e1[tri, 0] - px * e1[tri, 1]) / dn
+                inside = (u >= 0) & (v >= 0) & (u + v <= 1)
+                if not inside.any():
+                    continue
+                tri, u, v = tri[inside], u[inside], v[inside]
+                cols.append(ix[inside] * ny + iy[inside])
+                zhit.append(v0[tri, 2] + u * e1[tri, 2] + v * e2[tri, 2])
 
         # int16, not int32: the array holds a difference count, and its
         # magnitude is bounded by how many spans start or end in one cell --
@@ -647,6 +762,8 @@ class OrientationSet:
     @classmethod
     def so3(cls, step: float = 30.0):
         """ZXZ Euler grid covering all of SO(3) — the unbiased sweep."""
+        if not algorithm_enabled('so3'):
+            _refuse('so3')
         out = []
         for al in np.arange(0.0, 180.01, step):
             z1s = [0.0] if al in (0.0, 180.0) else np.arange(0.0, 360.0, step)
@@ -1339,6 +1456,8 @@ class Refiner:
 
     def descend(self, t, steps: Iterable[float] = (1.0, 0.5, 0.25, 0.1, 0.05, 0.02)):
         """Axis-wise coordinate descent on the objective, subject to feasibility."""
+        if not algorithm_enabled('descend'):
+            _refuse('descend')
         cur = np.asarray(t, float).copy()
         best = self.objective(cur)
         for step in steps:
@@ -1356,6 +1475,8 @@ class Refiner:
     @staticmethod
     def repair(t, axis: int, feasible, step: float = 0.25, limit: int = 400):
         """Push apart along ``axis`` until feasible (for an infeasible start)."""
+        if not algorithm_enabled('refiner_repair'):
+            _refuse('refiner_repair')
         t = np.asarray(t, float).copy()
         for _ in range(limit):
             if feasible(t):
@@ -1672,6 +1793,8 @@ class PairNester:
 
     def verify(self, path: str, n_samples: int = 250_000, seed: int = 12345) -> dict:
         """Re-measure the written file from scratch: bodies, volumes, true gap."""
+        if not algorithm_enabled('pair_nester_verify'):
+            _refuse('pair_nester_verify')
         chk = trimesh.load(path)
         parts = chk.split(only_watertight=False)
         out = {
@@ -1893,6 +2016,8 @@ class Inspector:
         Uses ``mesh.section``, which needs ``shapely``; falls back to counting
         occupied voxels per layer, which needs nothing extra.
         """
+        if not algorithm_enabled('slice_profile'):
+            _refuse('slice_profile')
         lo, hi = mesh.bounds[0][axis], mesh.bounds[1][axis]
         try:
             rows = []

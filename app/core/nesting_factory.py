@@ -28,6 +28,7 @@ import numpy as np
 import trimesh
 
 from .nesting3d import (
+    DISABLED_ALGORITHMS, algorithm_enabled,
     HAVE_FCL, BVHPairDistance, ClearanceGrid, Geometry, MeshAudit,
     OrientationSet, Preview, Refiner, ScanlineVoxelizer, SurfaceDistanceField,
     SurfacePairDistance, SurfaceSampleCache, TranslationOracle, Validation,
@@ -61,20 +62,43 @@ class AlgorithmRegistry:
 
     @classmethod
     def names(cls, category: str) -> list[str]:
+        """Every registered name, including any that are switched off."""
         return sorted(cls._reg.get(category, {}))
+
+    @classmethod
+    def enabled_names(cls, category: str) -> list[str]:
+        """Names a caller may actually select.
+
+        Offering a switched-off algorithm in a UI and then refusing it on
+        submit is a trap: the form defaulted to 'descend' and every upload was
+        rejected with the reason it was disabled. Anything user-facing lists
+        from here.
+        """
+        from .nesting3d import algorithm_enabled
+        return [n for n in cls.names(category) if algorithm_enabled(n)]
 
     @classmethod
     def categories(cls) -> list[str]:
         return sorted(cls._reg)
 
     @classmethod
+    def status_of(cls, category: str, name: str) -> str:
+        """Registered status, overridden to 'disabled' by the switchboard."""
+        from .nesting3d import algorithm_enabled
+        meta = cls._reg.get(category, {}).get(name)
+        if meta is None:
+            return "unknown"
+        return meta["status"] if algorithm_enabled(name) else "disabled"
+
+    @classmethod
     def catalogue(cls, status: str | None = None) -> list[tuple]:
         rows = []
         for cat in cls.categories():
             for name, meta in sorted(cls._reg[cat].items()):
-                if status and meta["status"] != status:
+                live = cls.status_of(cat, name)
+                if status and live != status:
                     continue
-                rows.append((cat, name, meta["status"], meta["note"]))
+                rows.append((cat, name, live, meta["note"]))
         return rows
 
     @classmethod
@@ -228,6 +252,26 @@ class NestingConfig:
     diversity_angle: float = 10.0     # deg between distinct rotations
     diversity_extent: float = 3.0     # mm between distinct bounding boxes
 
+    #: Volume error the voxeliser gate will admit. 2% is what every accuracy
+    #: claim in this engine rests on; the 'fast' profile raises it deliberately
+    #: and the report says so.
+    voxel_tolerance: float = 0.02
+    #: Search for the coarsest lattice this part still passes the accuracy gate
+    #: on, instead of always using ``fine_pitch``. Cost is cubic in 1/pitch, so
+    #: in principle this is the largest speed lever in the engine.
+    #:
+    #: Off by default, because measured it did not pay. On sample.stl no pitch
+    #: coarser than 0.5 mm passes the gate at all, so the search is pure
+    #: overhead (1.0x after the cheap screen was added, 0.7x before). On
+    #: electric_drill.stl a 2 mm lattice passes the gate and then puts the
+    #: refiner on a pose it cannot walk back to feasible, so the fallback
+    #: re-runs the whole job at 0.5 mm: 0.8x. The delivered geometry was
+    #: identical in both cases -- the cost is time, not accuracy.
+    #:
+    #: Kept and wired because it is the right lever for large parts, where the
+    #: gate does permit a coarse lattice and the cubic saving is real; it just
+    #: cannot be the default on parts like these.
+    auto_pitch: bool = False
     robustness_trials: int = 12
     cross_check: bool = True
     #: attempt automatic repair when the input mesh is not a closed solid.
@@ -253,15 +297,32 @@ class NestingConfig:
 
 
 PROFILES = {
+    # Deliberately inaccurate, for triaging a part rather than quoting it.
+    # This is the class of result a coarse voxel packer gives: a coarse
+    # lattice, the gate that would refuse it relaxed to suit, and no
+    # continuous refinement -- so the delivered gap is whatever the lattice
+    # happened to leave, looser than requested, not squeezed to it.
+    #
+    # Measured against 'quick' on sample.stl: see the note in the README. Use
+    # it to see roughly how a part nests; do not quote a clearance from it.
+    "fast": dict(coarse_step=45.0, so3_step=None, refiner="none",
+                 n_samples=40_000, cross_check=False, robustness_trials=2,
+                 fine_step=6.0, coarse_pitch=8.0, fine_pitch=4.0,
+                 voxel_tolerance=0.25, auto_pitch=True),
     # fast sanity check on a new part
-    "quick": dict(coarse_step=30.0, so3_step=None, refiner="descend",
+    # 'descend' is switched off (see DISABLED_ALGORITHMS), so quick refines
+    # with the profile sweep. That is the more accurate of the two and much
+    # dearer: measured 3,059 KD queries against 61 on the same part.
+    "quick": dict(coarse_step=30.0, so3_step=None, refiner="profile",
                   n_samples=120_000, cross_check=False, robustness_trials=6,
                   fine_step=3.0),
     # the settings that produced the reference result
     "standard": dict(coarse_step=15.0, so3_step=None, refiner="profile",
                      cross_check=True),
-    # adds the 744-orientation sweep, so the rotation is proven not assumed
-    "full": dict(coarse_step=15.0, so3_step=30.0, refiner="profile",
+    # the 744-orientation SO(3) sweep is switched off, so this now differs
+    # from 'standard' only in robustness_trials: the rotation is assumed from
+    # the Z-family rather than proven over SO(3).
+    "full": dict(coarse_step=15.0, so3_step=None, refiner="profile",
                  cross_check=True, robustness_trials=20),
 }
 
@@ -287,6 +348,15 @@ class NesterFactory:
                           ("refiner", cfg.refiner),
                           ("objective", cfg.objective)):
             AlgorithmRegistry.get(cat, name)          # fail fast on typos
+        for label in (cfg.refiner, cfg.orientations):
+            if not algorithm_enabled(label):
+                raise RuntimeError(
+                    f"the {label!r} algorithm is switched off: "
+                    f"{DISABLED_ALGORITHMS[label]}")
+        if cfg.so3_step and not algorithm_enabled("so3"):
+            raise RuntimeError(
+                "so3_step was given but the SO(3) sweep is switched off: "
+                + DISABLED_ALGORITHMS["so3"])
         if cfg.distance_backend == "bvh" and not HAVE_FCL:
             raise RuntimeError(
                 "distance_backend='bvh' needs python-fcl, which is not "
