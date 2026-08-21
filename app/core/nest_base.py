@@ -636,9 +636,15 @@ class NestingRecommender:
         for i, r in enumerate(recs, 1):
             r.rank = i
             self.export_one(mesh, r, out_dir / f"{stl_path.stem}_nest_{i:02d}.stl")
-            r.verified = self.verify_one(r.stl, full=(i <= 3),
-                                         n_faces=len(mesh.faces),
-                                         mesh=mesh, transform=r.transform)
+            if self.cfg.verify:
+                r.verified = self.verify_one(r.stl, full=(i <= 3),
+                                             n_faces=len(mesh.faces),
+                                             mesh=mesh, transform=r.transform)
+            else:
+                # recorded, not silently absent: a result that was never
+                # checked against the file on disk should say so
+                r.verified = {"skipped": True,
+                              "why": "verification is off for this profile"}
 
         self._log("[8/8] report")
         # every recommendation already has its GLB from export_one, so there is

@@ -252,6 +252,12 @@ class NestingConfig:
     diversity_angle: float = 10.0     # deg between distinct rotations
     diversity_extent: float = 3.0     # mm between distinct bounding boxes
 
+    #: Re-read each written STL from disk and re-measure its gap with a fresh
+    #: seed. It is the only check that works on the file rather than on the
+    #: meshes in memory, so it is the only thing that would catch a bad export
+    #: or a mis-applied transform -- an in-memory answer stays perfect through
+    #: both. Measured at 3.37 s of an 11.49 s run on sample.stl.
+    verify: bool = True
     #: Volume error the voxeliser gate will admit. 2% is what every accuracy
     #: claim in this engine rests on; the 'fast' profile raises it deliberately
     #: and the report says so.
@@ -308,7 +314,7 @@ PROFILES = {
     "fast": dict(coarse_step=45.0, so3_step=None, refiner="none",
                  n_samples=40_000, cross_check=False, robustness_trials=2,
                  fine_step=6.0, coarse_pitch=8.0, fine_pitch=4.0,
-                 voxel_tolerance=0.25, auto_pitch=True),
+                 voxel_tolerance=0.25, auto_pitch=True, verify=False),
     # fast sanity check on a new part
     # 'descend' is switched off (see DISABLED_ALGORITHMS), so quick refines
     # with the profile sweep. That is the more accurate of the two and much
